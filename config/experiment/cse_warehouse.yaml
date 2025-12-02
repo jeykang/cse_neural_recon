@@ -1,0 +1,50 @@
+# CSE Warehouse Experiment Configuration
+# Inherits from default.yaml and overrides specific settings
+
+defaults:
+  - default
+
+experiment_name: "cse_warehouse_static"
+
+data:
+  data_path: "data/warehouse_extracted/static_warehouse_robot1"
+  dataset_type: "cse"
+  
+  # Warehouse-specific settings
+  img_width: 640
+  img_height: 360
+  
+  # Larger space requires different depth bounds
+  min_depth: 0.1
+  max_depth: 30.0
+
+model:
+  neural_sdf:
+    hidden_features: 256
+    hidden_layers: 4
+    
+  planar_attention:
+    enabled: true
+    max_planes: 30  # Warehouses have many planar surfaces
+
+losses:
+  # Emphasize planar reconstruction for warehouse shelving
+  planar_weight: 0.4
+  manhattan_weight: 0.15
+
+training:
+  epochs: 30
+  batch_size: 4
+  
+inference:
+  # Larger bounds for warehouse
+  bounds:
+    x_min: -10.0
+    x_max: 10.0
+    y_min: -10.0
+    y_max: 10.0
+    z_min: -1.0
+    z_max: 5.0
+
+output:
+  output_dir: "output/warehouse_static"
