@@ -23,6 +23,7 @@ from .samplers import (
     SDFSampler,
     get_sampler
 )
+from .visualizer import TrainingVisualizer, generate_gt_point_cloud_from_batch
 
 __all__ = [
     # Trainer
@@ -44,5 +45,8 @@ __all__ = [
     'ImportanceSampler',
     'HybridSampler',
     'SDFSampler',
-    'get_sampler'
+    'get_sampler',
+    # Visualization
+    'TrainingVisualizer',
+    'generate_gt_point_cloud_from_batch',
 ]

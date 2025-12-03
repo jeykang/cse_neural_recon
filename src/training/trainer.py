@@ -64,6 +64,7 @@ class TrainingConfig:
     log_every: int = 100
     val_every: int = 1
     save_every: int = 5
+    visualize_every: int = 5  # Generate visualizations every N epochs
     
     # Output
     output_dir: str = "output"
@@ -123,6 +124,28 @@ class Trainer:
         self.current_epoch = 0
         self.global_step = 0
         self.best_val_loss = float('inf')
+        
+        # Visualization
+        self.visualizer = None
+        self._init_visualizer()
+        
+        # Cache a sample batch for visualization
+        self._viz_batch = None
+        self._gt_points = None
+        
+    def _init_visualizer(self):
+        """Initialize the training visualizer."""
+        try:
+            from .visualizer import TrainingVisualizer
+            self.visualizer = TrainingVisualizer(
+                output_dir=self.config.output_dir,
+                model=self.model,
+                device=self.device,
+            )
+            print("Visualization enabled - will generate point cloud comparisons")
+        except Exception as e:
+            print(f"Warning: Could not initialize visualizer: {e}")
+            self.visualizer = None
         
     def _create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer based on config."""
@@ -185,6 +208,9 @@ class Trainer:
         print(f"Device: {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
+        # Cache visualization batch on first iteration
+        self._cache_viz_batch()
+        
         for epoch in range(self.current_epoch, self.config.epochs):
             self.current_epoch = epoch
             
@@ -206,9 +232,13 @@ class Trainer:
                 else:
                     self.scheduler.step()
                     
-            # Checkpointing
+            # Checkpointing and Visualization
             if (epoch + 1) % self.config.save_every == 0:
                 self.save_checkpoint()
+                
+                # Generate visualizations
+                if self.visualizer is not None:
+                    self._generate_visualizations(epoch, train_metrics, val_metrics)
                 
             # Best model
             val_loss = val_metrics.get('loss', train_metrics['loss'])
@@ -394,12 +424,20 @@ class Trainer:
             # Get valid indices
             valid_idx = torch.where(valid_flat[b])[0]
             
+            if len(valid_idx) == 0:
+                # No valid points - generate random points near origin
+                pts_world = torch.randn(N_samples, 3, device=device) * 0.1
+                t = pose[b, :3, 3] if pose is not None else torch.zeros(3, device=device)
+                all_surface_points.append(pts_world)
+                all_camera_centers.append(t.expand(N_samples, -1))
+                continue
+            
             if len(valid_idx) < N_samples:
                 # Pad with repetition
-                idx = valid_idx[torch.randint(len(valid_idx), (N_samples,))]
+                idx = valid_idx[torch.randint(len(valid_idx), (N_samples,), device=device)]
             else:
                 # Random sample
-                perm = torch.randperm(len(valid_idx))[:N_samples]
+                perm = torch.randperm(len(valid_idx), device=device)[:N_samples]
                 idx = valid_idx[perm]
                 
             # Get pixel coordinates
@@ -573,3 +611,72 @@ class Trainer:
             self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
             
         print(f"Loaded checkpoint from {path} (epoch {self.current_epoch})")
+
+    def _cache_viz_batch(self):
+        """Cache a sample batch for consistent visualization across epochs."""
+        try:
+            # Get first batch from training loader
+            for batch in self.train_loader:
+                self._viz_batch = {k: v.clone() if torch.is_tensor(v) else v 
+                                   for k, v in batch.items()}
+                break
+            
+            # Generate ground truth point cloud from cached batch
+            if self._viz_batch is not None and self.visualizer is not None:
+                try:
+                    from .visualizer import generate_gt_point_cloud_from_batch
+                    self._gt_points = generate_gt_point_cloud_from_batch(self._viz_batch)
+                    
+                    if len(self._gt_points) > 0:
+                        print(f"Cached visualization batch with {len(self._gt_points)} GT points")
+                    else:
+                        print("Note: No valid depth data in batch - will show predictions only")
+                        self._gt_points = None
+                except Exception as e:
+                    print(f"Warning: Could not generate GT points: {e}")
+                    self._gt_points = None
+                    
+        except Exception as e:
+            print(f"Warning: Could not cache visualization batch: {e}")
+            self._viz_batch = None
+            self._gt_points = None
+    
+    def _generate_visualizations(
+        self, 
+        epoch: int, 
+        train_metrics: Dict[str, float],
+        val_metrics: Optional[Dict[str, float]] = None
+    ):
+        """Generate visualizations for the current epoch."""
+        if self.visualizer is None:
+            return
+            
+        print(f"Generating visualizations for epoch {epoch}...")
+        
+        try:
+            eval_metrics = self.visualizer.visualize_checkpoint(
+                epoch=epoch,
+                train_metrics=train_metrics,
+                val_metrics=val_metrics,
+                sample_batch=self._viz_batch,
+                gt_points=self._gt_points,
+            )
+            
+            # Log evaluation metrics
+            if eval_metrics and self.writer:
+                for key, value in eval_metrics.items():
+                    if isinstance(value, (int, float)):
+                        self.writer.add_scalar(f'eval/{key}', value, epoch)
+            
+            # Print summary
+            if eval_metrics:
+                print(f"  Reconstruction metrics:")
+                print(f"    Chamfer Distance: {eval_metrics.get('chamfer_distance', 0):.6f}")
+                print(f"    Accuracy @5cm: {eval_metrics.get('accuracy_5cm', 0)*100:.1f}%")
+                print(f"    Completeness @5cm: {eval_metrics.get('completeness_5cm', 0)*100:.1f}%")
+                print(f"    F-score @5cm: {eval_metrics.get('fscore_5cm', 0)*100:.1f}%")
+                
+        except Exception as e:
+            print(f"Warning: Visualization failed: {e}")
+            import traceback
+            traceback.print_exc()

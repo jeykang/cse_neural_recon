@@ -22,7 +22,7 @@ from .data import (
     CSEMultiCameraDataset,
     MultiCameraSynchronizer,
     CameraRig,
-    DataTransform,
+    DataAugmentation,
     DepthProcessor
 )
 
@@ -31,26 +31,21 @@ from .models import (
     NeuralSDF,
     NeuralSDFWithPlanar,
     HashGridEncoding,
-    MultiResolutionHashGrid,
     PositionalEncoding,
-    FourierFeatures,
     PlanarAttention,
     IterativePointFilter,
     ScoreNetwork,
-    ScoreBasedDenoiser
 )
 
 # Losses
 from .losses import (
     SDFLoss,
     SurfaceLoss,
-    FrespaceLoss,
+    FreespaceLoss,
     EikonalLoss,
     PlanarConsistencyLoss,
     ManhattanLoss,
     SmoothnessLoss,
-    LaplacianLoss,
-    TotalVariationLoss
 )
 
 # Training
@@ -91,29 +86,24 @@ __all__ = [
     'CSEMultiCameraDataset', 
     'MultiCameraSynchronizer',
     'CameraRig',
-    'DataTransform',
+    'DataAugmentation',
     'DepthProcessor',
     # Models
     'NeuralSDF',
     'NeuralSDFWithPlanar',
     'HashGridEncoding',
-    'MultiResolutionHashGrid',
     'PositionalEncoding',
-    'FourierFeatures',
     'PlanarAttention',
     'IterativePointFilter',
     'ScoreNetwork',
-    'ScoreBasedDenoiser',
     # Losses
     'SDFLoss',
     'SurfaceLoss',
-    'FrespaceLoss',
+    'FreespaceLoss',
     'EikonalLoss',
     'PlanarConsistencyLoss',
     'ManhattanLoss',
     'SmoothnessLoss',
-    'LaplacianLoss',
-    'TotalVariationLoss',
     # Training
     'Trainer',
     'TrainingConfig',

@@ -23,7 +23,7 @@ data:
   # Depth filtering
   min_depth: 0.1  # meters
   max_depth: 20.0  # meters
-  depth_scale: 1.0  # Depth image scale factor (1.0 = meters)
+  depth_scale: 0.001  # CSE depth is in mm, scale to meters
   
   # Data loading
   num_workers: 4

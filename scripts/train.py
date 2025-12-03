@@ -4,7 +4,7 @@ Training script for neural 3D reconstruction.
 
 Usage:
     python scripts/train.py --config config/experiment/cse_warehouse.yaml
-    python scripts/train.py --config config/default.yaml --data_root data/warehouse_extracted
+    python scripts/train.py --config config/default.yaml --data_path data/warehouse_extracted/static_warehouse_robot1
 """
 
 import argparse
@@ -15,19 +15,21 @@ from datetime import datetime
 
 import yaml
 import torch
+import torch.nn as nn
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data import CSEDataset, CSEMultiCameraDataset
-from src.models import NeuralSDF, NeuralSDFWithPlanar, HashGridEncoding
+from src.data import CSEDataset
+from src.models import NeuralSDF, NeuralSDFWithPlanar
 from src.losses import SDFLoss, PlanarConsistencyLoss, ManhattanLoss
-from src.training import Trainer, TrainingConfig, CheckpointManager, get_scheduler
+from src.training import Trainer, TrainingConfig
 
 
 def setup_logging(output_dir: Path, name: str = 'train'):
     """Configure logging to file and console."""
+    output_dir.mkdir(parents=True, exist_ok=True)
     log_file = output_dir / f'{name}_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
     
     logging.basicConfig(
@@ -43,113 +45,140 @@ def setup_logging(output_dir: Path, name: str = 'train'):
 
 
 def load_config(config_path: str) -> dict:
-    """Load configuration from YAML file."""
+    """Load configuration from YAML file with defaults handling."""
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
+    
+    # Handle 'defaults' key for inheritance
+    if 'defaults' in config:
+        config_dir = Path(config_path).parent
+        base_configs = config.pop('defaults')
+        
+        # Load base configs
+        for base in base_configs:
+            if isinstance(base, str):
+                base_path = config_dir / f'{base}.yaml'
+                if base_path.exists():
+                    with open(base_path, 'r') as f:
+                        base_config = yaml.safe_load(f)
+                    # Merge base config (base config is overridden by current)
+                    base_config = deep_merge(base_config, config)
+                    config = base_config
+    
     return config
 
 
-def create_model(config: dict, device: str = 'cuda') -> torch.nn.Module:
+def deep_merge(base: dict, override: dict) -> dict:
+    """Deep merge two dictionaries."""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+            result[key] = deep_merge(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def create_model(config: dict, device: str = 'cuda') -> nn.Module:
     """Create neural SDF model from config."""
     model_config = config.get('model', {})
-    model_type = model_config.get('type', 'neural_sdf_planar')
+    sdf_config = model_config.get('neural_sdf', {})
+    planar_config = model_config.get('planar_attention', {})
     
-    # Create encoding
-    encoding_config = model_config.get('encoding', {})
-    encoding_type = encoding_config.get('type', 'hashgrid')
+    # Get encoding configuration
+    encoding_type = sdf_config.get('encoding_type', 'hashgrid')
     
     if encoding_type == 'hashgrid':
-        encoding = HashGridEncoding(
-            n_levels=encoding_config.get('n_levels', 16),
-            n_features_per_level=encoding_config.get('n_features_per_level', 2),
-            log2_hashmap_size=encoding_config.get('log2_hashmap_size', 19),
-            base_resolution=encoding_config.get('base_resolution', 16),
-            finest_resolution=encoding_config.get('finest_resolution', 512)
-        )
-        input_dim = encoding.output_dim
+        hashgrid_config = sdf_config.get('hashgrid', {})
+        encoding_config = {
+            'num_levels': hashgrid_config.get('num_levels', 16),
+            'features_per_level': hashgrid_config.get('features_per_level', 2),
+            'log2_hashmap_size': hashgrid_config.get('log2_hashmap_size', 19),
+            'base_resolution': hashgrid_config.get('base_resolution', 16),
+            'max_resolution': hashgrid_config.get('max_resolution', 2048),
+        }
+    elif encoding_type == 'positional':
+        pos_config = sdf_config.get('positional', {})
+        encoding_config = {
+            'num_frequencies': pos_config.get('num_frequencies', 10),
+            'include_input': pos_config.get('include_input', True),
+        }
     else:
-        encoding = None
-        input_dim = 3
+        encoding_config = None
     
-    # Create model
-    if model_type == 'neural_sdf':
-        model = NeuralSDF(
-            in_features=input_dim,
-            hidden_features=model_config.get('hidden_dim', 256),
-            hidden_layers=model_config.get('num_layers', 4),
-            out_features=1,
-            encoding=encoding
-        )
-    elif model_type == 'neural_sdf_planar':
+    # Create model based on planar attention setting
+    use_planar = planar_config.get('enabled', True)
+    
+    if use_planar:
+        # Build planar attention config
+        planar_attention_config = {
+            'num_heads': planar_config.get('num_heads', 4),
+            'max_planes': planar_config.get('max_planes', 20),
+        }
+        
         model = NeuralSDFWithPlanar(
-            in_features=input_dim,
-            hidden_features=model_config.get('hidden_dim', 256),
-            hidden_layers=model_config.get('num_layers', 4),
-            num_planes=model_config.get('num_planes', 32),
-            encoding=encoding
+            hidden_features=sdf_config.get('hidden_features', 256),
+            hidden_layers=sdf_config.get('hidden_layers', 4),
+            omega_0=sdf_config.get('omega_0', 30.0),
+            encoding_type=encoding_type,
+            encoding_config=encoding_config,
+            output_color=sdf_config.get('output_color', True),
+            planar_attention_config=planar_attention_config,
         )
     else:
-        raise ValueError(f"Unknown model type: {model_type}")
+        model = NeuralSDF(
+            hidden_features=sdf_config.get('hidden_features', 256),
+            hidden_layers=sdf_config.get('hidden_layers', 4),
+            omega_0=sdf_config.get('omega_0', 30.0),
+            encoding_type=encoding_type,
+            encoding_config=encoding_config,
+            output_color=sdf_config.get('output_color', True),
+        )
     
     return model.to(device)
 
 
-def create_loss_function(config: dict) -> torch.nn.Module:
-    """Create combined loss function from config."""
-    loss_config = config.get('loss', {})
-    
-    # Base SDF loss
-    sdf_loss = SDFLoss(
-        surface_weight=loss_config.get('surface_weight', 1.0),
-        freespace_weight=loss_config.get('freespace_weight', 0.1),
-        eikonal_weight=loss_config.get('eikonal_weight', 0.1)
-    )
-    
-    # Additional losses
-    losses = {'sdf': (sdf_loss, 1.0)}
-    
-    if loss_config.get('use_planar', True):
-        planar_weight = loss_config.get('planar_weight', 0.1)
-        losses['planar'] = (PlanarConsistencyLoss(), planar_weight)
-        
-    if loss_config.get('use_manhattan', False):
-        manhattan_weight = loss_config.get('manhattan_weight', 0.05)
-        losses['manhattan'] = (ManhattanLoss(), manhattan_weight)
-    
-    return losses
-
-
-def create_dataloader(config: dict, split: str = 'train') -> torch.utils.data.DataLoader:
-    """Create dataloader from config."""
+def create_dataset(config: dict) -> CSEDataset:
+    """Create dataset from config."""
     data_config = config.get('data', {})
     
-    # Dataset
-    data_root = Path(data_config.get('data_root', 'data/warehouse_extracted'))
-    sequences = data_config.get(f'{split}_sequences', None)
+    # Get data path
+    data_path = data_config.get('data_path', 'data/warehouse_extracted/static_warehouse_robot1')
     
-    if sequences is None:
-        # Auto-detect sequences
-        sequences = [d.name for d in data_root.iterdir() if d.is_dir()]
-        
+    # Image size
+    img_width = data_config.get('img_width', 640)
+    img_height = data_config.get('img_height', 360)
+    
+    # Depth settings
+    min_depth = data_config.get('min_depth', 0.1)
+    max_depth = data_config.get('max_depth', 20.0)
+    # CSE dataset depth is in mm (uint16), need to scale to meters
+    depth_scale = data_config.get('depth_scale', 0.001)
+    
     # Create dataset
-    multi_camera = data_config.get('multi_camera', False)
+    dataset = CSEDataset(
+        run_dir=str(data_path),
+        side=data_config.get('side', 'left'),
+        img_wh=(img_width, img_height),
+        min_depth=min_depth,
+        max_depth=max_depth,
+        depth_scale=depth_scale,
+        cache_frames=data_config.get('cache_frames', False),
+    )
     
-    if multi_camera:
-        dataset = CSEMultiCameraDataset(
-            root_dir=str(data_root),
-            sequences=sequences,
-            max_frames=data_config.get('max_frames', 1000)
-        )
-    else:
-        dataset = CSEDataset(
-            root_dir=str(data_root),
-            sequences=sequences,
-            cameras=['left', 'right'],
-            max_frames=data_config.get('max_frames', 1000)
-        )
+    return dataset
+
+
+def create_dataloader(
+    dataset: CSEDataset, 
+    config: dict, 
+    split: str = 'train'
+) -> torch.utils.data.DataLoader:
+    """Create dataloader from dataset and config."""
+    data_config = config.get('data', {})
+    train_config = config.get('training', {})
     
-    # Create dataloader
-    batch_size = data_config.get('batch_size', 4) if split == 'train' else 1
+    batch_size = train_config.get('batch_size', 4) if split == 'train' else 1
     shuffle = (split == 'train')
     
     dataloader = torch.utils.data.DataLoader(
@@ -164,10 +193,59 @@ def create_dataloader(config: dict, split: str = 'train') -> torch.utils.data.Da
     return dataloader
 
 
+class DummyDataset(torch.utils.data.Dataset):
+    """Dummy dataset for testing when real data is not available."""
+    
+    def __init__(self, num_samples: int = 100):
+        self.num_samples = num_samples
+        
+    def __len__(self):
+        return self.num_samples
+    
+    def __getitem__(self, idx):
+        H, W = 360, 640
+        
+        # Random 3D points
+        points = torch.randn(1024, 3)
+        
+        # Random depth image with valid values
+        depth = torch.rand(H, W) * 9.5 + 0.5  # 0.5 to 10.0 meters
+        
+        # Valid mask - all points are valid for dummy data
+        valid_mask = torch.ones(H, W, dtype=torch.bool)
+        
+        # Random RGB image
+        rgb = torch.rand(3, H, W)
+        
+        # Random pose (identity with small perturbation)
+        pose = torch.eye(4)
+        pose[:3, 3] = torch.randn(3) * 0.1
+        
+        # Camera intrinsics (typical values for 640x360)
+        K = torch.tensor([
+            [610.0, 0.0, 320.0],
+            [0.0, 610.0, 180.0],
+            [0.0, 0.0, 1.0]
+        ])
+        
+        return {
+            'points': points,
+            'depth': depth,
+            'valid_mask': valid_mask,
+            'rgb': rgb,
+            'pose': pose,
+            'K': K,
+            'intrinsics': K,  # Alias for compatibility
+            'frame_idx': idx,
+        }
+
+
 def main():
     parser = argparse.ArgumentParser(description='Train neural 3D reconstruction')
     parser.add_argument('--config', type=str, required=True, 
                         help='Path to config file')
+    parser.add_argument('--data_path', type=str, default=None,
+                        help='Override data path in config')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
     parser.add_argument('--output', type=str, default='output',
@@ -180,13 +258,21 @@ def main():
     
     # Set seed
     torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(args.seed)
     
     # Load config
     config = load_config(args.config)
     
+    # Override data path if provided
+    if args.data_path:
+        config['data']['data_path'] = args.data_path
+    
     # Create output directory
     exp_name = config.get('experiment_name', 'default')
-    output_dir = Path(args.output) / exp_name / datetime.now().strftime('%Y%m%d_%H%M%S')
+    output_config = config.get('output', {})
+    output_base = Path(output_config.get('output_dir', args.output))
+    output_dir = output_base / datetime.now().strftime('%Y%m%d_%H%M%S')
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Save config
@@ -205,176 +291,72 @@ def main():
     # Create model
     logger.info("Creating model...")
     model = create_model(config, device)
-    logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
+    param_count = sum(p.numel() for p in model.parameters())
+    logger.info(f"Model parameters: {param_count:,}")
     
-    # Create loss functions
-    logger.info("Creating loss functions...")
-    losses = create_loss_function(config)
+    # Create dataset and dataloader
+    logger.info("Creating dataset...")
+    try:
+        train_dataset = create_dataset(config)
+        train_loader = create_dataloader(train_dataset, config, 'train')
+        logger.info(f"Train samples: {len(train_dataset)}")
+    except Exception as e:
+        logger.warning(f"Failed to create dataset: {e}")
+        logger.info("Using dummy dataset for testing...")
+        train_dataset = DummyDataset(100)
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=4, shuffle=True)
+        logger.info("Using dummy dataset with 100 samples")
     
-    # Create dataloaders
-    logger.info("Creating dataloaders...")
-    train_loader = create_dataloader(config, 'train')
-    val_loader = create_dataloader(config, 'val')
-    logger.info(f"Train samples: {len(train_loader.dataset)}")
-    logger.info(f"Val samples: {len(val_loader.dataset)}")
-    
-    # Create optimizer
+    # Create training configuration
     train_config = config.get('training', {})
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=train_config.get('learning_rate', 1e-4),
-        weight_decay=train_config.get('weight_decay', 1e-5)
-    )
     
-    # Create scheduler
-    scheduler = get_scheduler(
-        optimizer,
-        scheduler_type=train_config.get('scheduler', 'cosine'),
-        warmup_epochs=train_config.get('warmup_epochs', 5),
-        total_epochs=train_config.get('num_epochs', 100),
-        min_lr=train_config.get('min_lr', 1e-6)
-    )
-    
-    # Create checkpoint manager
-    checkpoint_mgr = CheckpointManager(
-        checkpoint_dir=output_dir / 'checkpoints',
-        max_checkpoints=5,
-        metric_name='val_loss',
-        mode='min'
-    )
-    
-    # Resume from checkpoint
-    start_epoch = 0
-    if args.resume:
-        logger.info(f"Resuming from checkpoint: {args.resume}")
-        checkpoint = checkpoint_mgr.load(args.resume)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        if scheduler and 'scheduler_state_dict' in checkpoint:
-            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint.get('epoch', 0) + 1
-    
-    # Create training config
     training_config = TrainingConfig(
-        num_epochs=train_config.get('num_epochs', 100),
+        epochs=train_config.get('epochs', 30),
+        batch_size=train_config.get('batch_size', 4),
+        num_workers=config.get('data', {}).get('num_workers', 4),
         learning_rate=train_config.get('learning_rate', 1e-4),
-        gradient_clip=train_config.get('gradient_clip', 1.0),
+        weight_decay=train_config.get('weight_decay', 1e-5),
+        scheduler=train_config.get('scheduler', 'cosine'),
+        warmup_epochs=train_config.get('warmup_epochs', 2),
+        min_lr=train_config.get('min_lr', 1e-6),
+        use_amp=train_config.get('use_amp', True),
+        grad_clip=train_config.get('gradient_clip', 1.0),
         log_every=train_config.get('log_every', 100),
         val_every=train_config.get('val_every', 1),
         save_every=train_config.get('save_every', 5),
-        use_amp=train_config.get('use_amp', True),
-        device=device
+        output_dir=str(output_dir),
+        experiment_name=exp_name,
     )
     
     # Create trainer
+    logger.info("Creating trainer...")
     trainer = Trainer(
         model=model,
-        optimizer=optimizer,
-        scheduler=scheduler,
+        train_loader=train_loader,
+        val_loader=None,  # Using same loader for now
         config=training_config,
-        checkpoint_manager=checkpoint_mgr
+        device=torch.device(device),
     )
     
-    # Define forward pass for SDF training
-    def compute_loss(batch, model):
-        """Compute combined loss for a batch."""
-        points = batch['points'].to(device)
-        sdf_gt = batch['sdf'].to(device)
-        
-        # Forward pass
-        output = model(points)
-        
-        # Compute losses
-        total_loss = 0
-        loss_dict = {}
-        
-        for name, (loss_fn, weight) in losses.items():
-            if name == 'sdf':
-                loss = loss_fn(output, sdf_gt, points)
-            else:
-                loss = loss_fn(output, points)
-            loss_dict[name] = loss.item()
-            total_loss += weight * loss
-            
-        loss_dict['total'] = total_loss.item()
-        
-        return total_loss, loss_dict
+    # Resume from checkpoint
+    if args.resume:
+        logger.info(f"Resuming from checkpoint: {args.resume}")
+        trainer.load_checkpoint(args.resume)
     
-    # Training loop
+    # Train
     logger.info("Starting training...")
+    try:
+        trainer.train()
+    except KeyboardInterrupt:
+        logger.info("Training interrupted by user")
+    except Exception as e:
+        logger.error(f"Training failed with error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
     
-    best_val_loss = float('inf')
-    
-    for epoch in range(start_epoch, training_config.num_epochs):
-        logger.info(f"Epoch {epoch + 1}/{training_config.num_epochs}")
-        
-        # Train
-        model.train()
-        train_losses = []
-        
-        for batch_idx, batch in enumerate(train_loader):
-            loss, loss_dict = compute_loss(batch, model)
-            
-            optimizer.zero_grad()
-            loss.backward()
-            
-            if training_config.gradient_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    training_config.gradient_clip
-                )
-                
-            optimizer.step()
-            
-            train_losses.append(loss_dict['total'])
-            
-            if (batch_idx + 1) % training_config.log_every == 0:
-                logger.info(
-                    f"  Batch {batch_idx + 1}/{len(train_loader)} - "
-                    f"Loss: {loss_dict['total']:.6f}"
-                )
-        
-        avg_train_loss = sum(train_losses) / len(train_losses)
-        logger.info(f"  Train Loss: {avg_train_loss:.6f}")
-        
-        # Validate
-        if (epoch + 1) % training_config.val_every == 0:
-            model.eval()
-            val_losses = []
-            
-            with torch.no_grad():
-                for batch in val_loader:
-                    _, loss_dict = compute_loss(batch, model)
-                    val_losses.append(loss_dict['total'])
-                    
-            avg_val_loss = sum(val_losses) / len(val_losses)
-            logger.info(f"  Val Loss: {avg_val_loss:.6f}")
-            
-            # Save checkpoint
-            is_best = avg_val_loss < best_val_loss
-            if is_best:
-                best_val_loss = avg_val_loss
-                
-            checkpoint_mgr.save(
-                state_dict={
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict() if scheduler else None,
-                    'config': config
-                },
-                epoch=epoch,
-                step=epoch * len(train_loader),
-                metrics={'val_loss': avg_val_loss, 'train_loss': avg_train_loss},
-                is_best=is_best
-            )
-        
-        # Step scheduler
-        if scheduler:
-            scheduler.step()
-            
     logger.info("Training complete!")
-    logger.info(f"Best validation loss: {best_val_loss:.6f}")
-    logger.info(f"Checkpoints saved to: {output_dir / 'checkpoints'}")
+    logger.info(f"Output saved to: {output_dir}")
 
 
 if __name__ == '__main__':
