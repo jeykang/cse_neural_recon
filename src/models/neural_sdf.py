@@ -3,16 +3,249 @@ Enhanced Neural SDF model with planar priors.
 
 Implements:
 - SIREN (Sinusoidal Representation Networks) backbone
+- Hash grid-based SDF with proper MLP (Instant-NGP style)
 - Optional planar attention module
 - Multi-head outputs (SDF, color, semantics)
+- Geometric initialization for stable SDF learning
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 from typing import Optional, Tuple, Dict
 
 from .encodings import PositionalEncoding, HashGridEncoding
+
+
+class GeometricLinear(nn.Linear):
+    """
+    Linear layer with geometric initialization for SDF networks.
+    
+    Based on SAL (Sign Agnostic Learning) and IGR initialization schemes.
+    """
+    
+    def __init__(self, in_features: int, out_features: int, bias: bool = True,
+                 init_type: str = 'geometric'):
+        super().__init__(in_features, out_features, bias)
+        self.init_type = init_type
+        self._init_weights()
+    
+    def _init_weights(self):
+        """Initialize weights for SDF learning."""
+        if self.init_type == 'geometric':
+            # Geometric initialization (similar to IGR)
+            nn.init.xavier_uniform_(self.weight)
+            if self.bias is not None:
+                nn.init.zeros_(self.bias)
+        elif self.init_type == 'sphere':
+            # Initialize to approximate a sphere SDF
+            nn.init.normal_(self.weight, 0.0, np.sqrt(2 / self.in_features))
+            if self.bias is not None:
+                nn.init.zeros_(self.bias)
+
+
+class HashGridSDF(nn.Module):
+    """
+    Hash Grid-based SDF network following Instant-NGP architecture.
+    
+    Key differences from SIREN:
+    - Uses ReLU/Softplus activations (not sine)
+    - Skip connections at middle layer
+    - Geometric initialization for sphere bias
+    - Weight normalization for stability
+    
+    Args:
+        hidden_features: Hidden layer dimension
+        hidden_layers: Number of hidden layers  
+        encoding_config: Configuration for hash grid encoding
+        output_color: Whether to output RGB color
+        use_weight_norm: Whether to use weight normalization
+        geometric_init: Whether to use geometric initialization
+        sphere_init_radius: Initial sphere radius for bias
+    """
+    
+    def __init__(
+        self,
+        hidden_features: int = 256,
+        hidden_layers: int = 6,
+        encoding_config: Optional[Dict] = None,
+        output_color: bool = True,
+        use_weight_norm: bool = True,
+        geometric_init: bool = True,
+        sphere_init_radius: float = 0.5
+    ):
+        super().__init__()
+        
+        self.hidden_features = hidden_features
+        self.hidden_layers = hidden_layers
+        self.output_color = output_color
+        self.geometric_init = geometric_init
+        self.sphere_init_radius = sphere_init_radius
+        
+        # Setup hash grid encoding
+        config = encoding_config or {}
+        self.encoding = HashGridEncoding(**config)
+        input_dim = self.encoding.output_dim
+        
+        # Calculate skip connection layer (at middle)
+        self.skip_layer = hidden_layers // 2
+        
+        # Build MLP layers
+        self.layers = nn.ModuleList()
+        
+        # First layer
+        layer = nn.Linear(input_dim, hidden_features)
+        if use_weight_norm:
+            layer = nn.utils.weight_norm(layer)
+        self.layers.append(layer)
+        
+        # Hidden layers with skip connection
+        for i in range(hidden_layers - 1):
+            if i == self.skip_layer:
+                # Skip connection: concat input features
+                in_dim = hidden_features + input_dim
+            else:
+                in_dim = hidden_features
+                
+            layer = nn.Linear(in_dim, hidden_features)
+            if use_weight_norm:
+                layer = nn.utils.weight_norm(layer)
+            self.layers.append(layer)
+        
+        # SDF output head with geometric initialization
+        self.sdf_head = nn.Linear(hidden_features, 1)
+        
+        # Color output head
+        if output_color:
+            self.color_head = nn.Sequential(
+                nn.Linear(hidden_features, hidden_features // 2),
+                nn.ReLU(),
+                nn.Linear(hidden_features // 2, 3),
+                nn.Sigmoid()
+            )
+        
+        # Apply geometric initialization
+        if geometric_init:
+            self._geometric_init()
+    
+    def _geometric_init(self):
+        """
+        Initialize network to output an approximate sphere SDF.
+        
+        This is critical for SDF learning - without it, the network
+        often converges to degenerate constant-output solutions.
+        """
+        # Initialize hidden layers with proper variance
+        for i, layer in enumerate(self.layers):
+            # Handle weight-normalized layers
+            if hasattr(layer, 'weight_v'):
+                weight = layer.weight_v
+            else:
+                weight = layer.weight
+            
+            # Xavier-like init scaled for ReLU
+            fan_in = weight.shape[1]
+            std = float(np.sqrt(2.0 / fan_in))
+            nn.init.normal_(weight, 0.0, std)
+            
+            # Handle bias
+            bias = getattr(layer, 'bias', None)
+            if bias is not None:
+                nn.init.zeros_(bias)
+        
+        # Special initialization for SDF head to approximate sphere
+        # SDF(x) ≈ |x - center| - radius
+        # For normalized coords in [0,1], center at 0.5, radius = sphere_init_radius
+        nn.init.normal_(self.sdf_head.weight, mean=0.0, std=1e-4)
+        # Bias to output positive values (outside sphere initially)
+        nn.init.constant_(self.sdf_head.bias, self.sphere_init_radius)
+    
+    def forward(
+        self,
+        coords: torch.Tensor,
+        return_features: bool = False
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass through the network.
+        
+        Args:
+            coords: (B, 3) or (B, N, 3) 3D coordinates in [0, 1]
+            return_features: Whether to return intermediate features
+            
+        Returns:
+            Dictionary containing sdf, color, features
+        """
+        original_shape = coords.shape[:-1]
+        coords_flat = coords.view(-1, 3)
+        
+        # Hash grid encoding
+        x = self.encoding(coords_flat)
+        encoded = x  # Save for skip connection
+        
+        # Forward through MLP with skip connection
+        for i, layer in enumerate(self.layers):
+            if i == self.skip_layer + 1:
+                # Add skip connection
+                x = torch.cat([x, encoded], dim=-1)
+            
+            x = layer(x)
+            x = F.relu(x)
+        
+        features = x
+        
+        # Compute outputs
+        outputs = {}
+        
+        # SDF
+        sdf = self.sdf_head(features)
+        outputs['sdf'] = sdf.view(*original_shape, 1)
+        
+        # Color
+        if self.output_color:
+            color = self.color_head(features)
+            outputs['color'] = color.view(*original_shape, 3)
+        
+        # Features
+        if return_features:
+            outputs['features'] = features.view(*original_shape, self.hidden_features)
+        
+        return outputs
+    
+    def gradient(self, coords: torch.Tensor) -> torch.Tensor:
+        """Compute gradient of SDF w.r.t. coordinates."""
+        coords = coords.requires_grad_(True)
+        outputs = self.forward(coords)
+        sdf = outputs['sdf']
+        
+        gradient = torch.autograd.grad(
+            sdf,
+            coords,
+            grad_outputs=torch.ones_like(sdf),
+            create_graph=True,
+            retain_graph=True
+        )[0]
+        
+        return gradient
+    
+    def sdf_and_gradient(
+        self,
+        coords: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute SDF value and gradient simultaneously."""
+        coords = coords.requires_grad_(True)
+        outputs = self.forward(coords)
+        sdf = outputs['sdf']
+        
+        gradient = torch.autograd.grad(
+            sdf,
+            coords,
+            grad_outputs=torch.ones_like(sdf),
+            create_graph=True,
+            retain_graph=True
+        )[0]
+        
+        return sdf, gradient
 
 
 class SineLayer(nn.Module):

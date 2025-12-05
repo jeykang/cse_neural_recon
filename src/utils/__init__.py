@@ -24,6 +24,13 @@ from .metrics import (
     f_score,
     hausdorff_distance
 )
+from .productivity_metrics import (
+    ProductivityMetricsCollector,
+    ProductivityReport,
+    GPUMetricsCollector,
+    TrainingProfiler,
+    create_comparison_baseline
+)
 
 __all__ = [
     # Visualization
@@ -44,5 +51,11 @@ __all__ = [
     'point_cloud_accuracy',
     'point_cloud_completeness',
     'f_score',
-    'hausdorff_distance'
+    'hausdorff_distance',
+    # Productivity Metrics
+    'ProductivityMetricsCollector',
+    'ProductivityReport',
+    'GPUMetricsCollector',
+    'TrainingProfiler',
+    'create_comparison_baseline',
 ]

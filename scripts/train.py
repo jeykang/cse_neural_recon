@@ -22,7 +22,7 @@ PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.data import CSEDataset
-from src.models import NeuralSDF, NeuralSDFWithPlanar
+from src.models import NeuralSDF, NeuralSDFWithPlanar, HashGridSDF
 from src.losses import SDFLoss, PlanarConsistencyLoss, ManhattanLoss
 from src.training import Trainer, TrainingConfig
 
@@ -106,19 +106,36 @@ def create_model(config: dict, device: str = 'cuda') -> nn.Module:
     else:
         encoding_config = None
     
-    # Create model based on planar attention setting
-    use_planar = planar_config.get('enabled', True)
+    hidden_features = sdf_config.get('hidden_features', 256)
+    hidden_layers = sdf_config.get('hidden_layers', 6)
     
-    if use_planar:
+    # Use HashGridSDF when encoding is hashgrid (proper architecture for hash grids)
+    use_planar = planar_config.get('enabled', False)  # Disable planar by default for stability
+    
+    if encoding_type == 'hashgrid' and not use_planar:
+        # Use the new HashGridSDF architecture designed for hash grid encoding
+        # This uses ReLU MLP instead of SIREN, with geometric initialization
+        print("Using HashGridSDF model with geometric initialization")
+        
+        model = HashGridSDF(
+            hidden_features=hidden_features,
+            hidden_layers=hidden_layers,
+            encoding_config=encoding_config,
+            output_color=sdf_config.get('output_color', True),
+            use_weight_norm=sdf_config.get('use_weight_norm', True),
+            geometric_init=sdf_config.get('geometric_init', True),
+            sphere_init_radius=sdf_config.get('sphere_init_radius', 0.5),
+        )
+    elif use_planar:
         # Build planar attention config
         planar_attention_config = {
-            'num_heads': planar_config.get('num_heads', 4),
-            'max_planes': planar_config.get('max_planes', 20),
+            'num_heads': planar_config.get('num_heads', 8),
+            'max_planes': planar_config.get('max_planes', 30),
         }
         
         model = NeuralSDFWithPlanar(
-            hidden_features=sdf_config.get('hidden_features', 256),
-            hidden_layers=sdf_config.get('hidden_layers', 4),
+            hidden_features=hidden_features,
+            hidden_layers=hidden_layers,
             omega_0=sdf_config.get('omega_0', 30.0),
             encoding_type=encoding_type,
             encoding_config=encoding_config,
@@ -127,13 +144,17 @@ def create_model(config: dict, device: str = 'cuda') -> nn.Module:
         )
     else:
         model = NeuralSDF(
-            hidden_features=sdf_config.get('hidden_features', 256),
-            hidden_layers=sdf_config.get('hidden_layers', 4),
+            hidden_features=hidden_features,
+            hidden_layers=hidden_layers,
             omega_0=sdf_config.get('omega_0', 30.0),
             encoding_type=encoding_type,
             encoding_config=encoding_config,
             output_color=sdf_config.get('output_color', True),
         )
+    
+    # Print model info
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Model parameters: {num_params:,}")
     
     return model.to(device)
 
@@ -246,6 +267,8 @@ def main():
                         help='Path to config file')
     parser.add_argument('--data_path', type=str, default=None,
                         help='Override data path in config')
+    parser.add_argument('--epochs', type=int, default=None,
+                        help='Override number of epochs in config')
     parser.add_argument('--resume', type=str, default=None,
                         help='Path to checkpoint to resume from')
     parser.add_argument('--output', type=str, default='output',
@@ -267,6 +290,12 @@ def main():
     # Override data path if provided
     if args.data_path:
         config['data']['data_path'] = args.data_path
+    
+    # Override epochs if provided
+    if args.epochs is not None:
+        if 'training' not in config:
+            config['training'] = {}
+        config['training']['epochs'] = args.epochs
     
     # Create output directory
     exp_name = config.get('experiment_name', 'default')
@@ -311,19 +340,33 @@ def main():
     train_config = config.get('training', {})
     
     training_config = TrainingConfig(
-        epochs=train_config.get('epochs', 30),
-        batch_size=train_config.get('batch_size', 4),
-        num_workers=config.get('data', {}).get('num_workers', 4),
-        learning_rate=train_config.get('learning_rate', 1e-4),
-        weight_decay=train_config.get('weight_decay', 1e-5),
-        scheduler=train_config.get('scheduler', 'cosine'),
-        warmup_epochs=train_config.get('warmup_epochs', 2),
-        min_lr=train_config.get('min_lr', 1e-6),
-        use_amp=train_config.get('use_amp', True),
-        grad_clip=train_config.get('gradient_clip', 1.0),
-        log_every=train_config.get('log_every', 100),
-        val_every=train_config.get('val_every', 1),
-        save_every=train_config.get('save_every', 5),
+        epochs=int(train_config.get('epochs', 50)),
+        batch_size=int(train_config.get('batch_size', 8)),
+        num_workers=int(config.get('data', {}).get('num_workers', 4)),
+        optimizer=str(train_config.get('optimizer', 'adamw')),
+        learning_rate=float(train_config.get('learning_rate', 5e-4)),
+        weight_decay=float(train_config.get('weight_decay', 1e-4)),
+        scheduler=str(train_config.get('scheduler', 'cosine')),
+        warmup_epochs=int(train_config.get('warmup_epochs', 3)),
+        min_lr=float(train_config.get('min_lr', 1e-6)),
+        use_amp=bool(train_config.get('use_amp', True)),
+        grad_clip=float(train_config.get('gradient_clip', 1.0)),
+        # Sampling
+        num_surface_samples=int(train_config.get('num_surface_samples', 8192)),
+        num_freespace_samples=int(train_config.get('num_freespace_samples', 8192)),
+        num_random_samples=int(train_config.get('num_random_samples', 4096)),
+        freespace_jitter_min=float(train_config.get('freespace_jitter_min', 0.1)),
+        freespace_jitter_max=float(train_config.get('freespace_jitter_max', 3.0)),
+        # Loss weights
+        surface_weight=float(train_config.get('surface_weight', 1.0)),
+        freespace_weight=float(train_config.get('freespace_weight', 2.0)),
+        eikonal_weight=float(train_config.get('eikonal_weight', 0.05)),
+        random_space_weight=float(train_config.get('random_space_weight', 1.5)),
+        # Logging
+        log_every=int(train_config.get('log_every', 100)),
+        val_every=int(train_config.get('val_every', 1)),
+        save_every=int(train_config.get('save_every', 5)),
+        visualize_every=int(train_config.get('visualize_every', 5)),
         output_dir=str(output_dir),
         experiment_name=exp_name,
     )

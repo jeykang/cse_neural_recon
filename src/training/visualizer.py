@@ -38,7 +38,7 @@ class TrainingVisualizer:
         output_dir: str,
         model: nn.Module,
         device: torch.device,
-        bounds: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+        scene_bounds: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         grid_resolution: int = 128,
     ):
         """
@@ -46,7 +46,7 @@ class TrainingVisualizer:
             output_dir: Directory to save visualizations
             model: Neural SDF model
             device: Compute device
-            bounds: Scene bounds (min, max) as 3D vectors
+            scene_bounds: World coordinate scene bounds (min, max) as tensors - for display
             grid_resolution: Resolution for SDF grid extraction
         """
         self.output_dir = Path(output_dir)
@@ -57,11 +57,12 @@ class TrainingVisualizer:
         self.device = device
         self.grid_resolution = grid_resolution
         
-        # Default bounds if not provided
-        if bounds is None:
-            self.bounds = (np.array([-5, -5, -1]), np.array([5, 5, 3]))
-        else:
-            self.bounds = bounds
+        # Store scene bounds for converting back to world coordinates
+        # Model always operates in normalized [0, 1] space
+        self.scene_bounds = scene_bounds  # Will be set by trainer
+        
+        # Model operates in normalized [0, 1] coordinate space
+        self.bounds = (np.array([0.0, 0.0, 0.0]), np.array([1.0, 1.0, 1.0]))
             
         # Metric history for plotting
         self.metric_history: Dict[str, List[float]] = {
@@ -76,6 +77,27 @@ class TrainingVisualizer:
             'accuracy_5cm': [],
             'completeness': [],
         }
+    
+    def set_scene_bounds(self, scene_min: torch.Tensor, scene_max: torch.Tensor):
+        """Set scene bounds for coordinate denormalization."""
+        self.scene_bounds = (scene_min.cpu().numpy(), scene_max.cpu().numpy())
+        print(f"Visualizer scene bounds set: min={self.scene_bounds[0]}, max={self.scene_bounds[1]}")
+    
+    def _denormalize_points(self, points: np.ndarray) -> np.ndarray:
+        """Convert normalized [0, 1] points back to world coordinates for visualization."""
+        if self.scene_bounds is None:
+            return points  # No denormalization if bounds not set
+        
+        scene_min, scene_max = self.scene_bounds
+        return points * (scene_max - scene_min) + scene_min
+    
+    def _normalize_points(self, points: np.ndarray) -> np.ndarray:
+        """Convert world coordinates to normalized [0, 1] coordinates."""
+        if self.scene_bounds is None:
+            return points
+        
+        scene_min, scene_max = self.scene_bounds
+        return (points - scene_min) / (scene_max - scene_min + 1e-8)
         
     def visualize_checkpoint(
         self,
@@ -147,11 +169,15 @@ class TrainingVisualizer:
         return eval_metrics
     
     def _extract_point_cloud(self, threshold: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
-        """Extract point cloud from neural SDF using marching cubes-style sampling."""
+        """Extract point cloud from neural SDF using marching cubes-style sampling.
+        
+        The model operates in normalized [0, 1] coordinates, but we return 
+        points in world coordinates for visualization and comparison.
+        """
         self.model.eval()
         
-        # Create 3D grid
-        min_bound, max_bound = self.bounds
+        # Create 3D grid in normalized [0, 1] space (model's input space)
+        min_bound, max_bound = self.bounds  # [0, 0, 0] to [1, 1, 1]
         x = np.linspace(min_bound[0], max_bound[0], self.grid_resolution)
         y = np.linspace(min_bound[1], max_bound[1], self.grid_resolution)
         z = np.linspace(min_bound[2], max_bound[2], self.grid_resolution)
@@ -170,26 +196,34 @@ class TrainingVisualizer:
                 points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=-1)
                 points_tensor = torch.from_numpy(points).float().to(self.device)
                 
-                # Query model
+                # Query model (expects normalized coords)
                 output = self.model(points_tensor.unsqueeze(0))
                 sdf = output['sdf'].squeeze().cpu().numpy()
                 
                 sdf_grid[i] = sdf.reshape(self.grid_resolution, self.grid_resolution)
         
         # Extract surface points (where SDF is close to zero)
-        surface_mask = np.abs(sdf_grid) < 0.02  # Near-surface threshold
+        # Use smaller threshold to avoid extracting too many points
+        surface_mask = np.abs(sdf_grid) < 0.005  # Tighter threshold in normalized space
         
-        # Get coordinates of surface points
+        # Get coordinates of surface points (in normalized space)
         indices = np.where(surface_mask)
         if len(indices[0]) == 0:
-            return np.zeros((0, 3)), np.zeros((0,))
+            # Fallback: use slightly larger threshold
+            surface_mask = np.abs(sdf_grid) < 0.01
+            indices = np.where(surface_mask)
+            if len(indices[0]) == 0:
+                return np.zeros((0, 3)), np.zeros((0,))
         
-        # Convert indices to world coordinates
-        points = np.stack([
+        # Convert indices to normalized [0, 1] coordinates
+        points_normalized = np.stack([
             min_bound[0] + indices[0] * (max_bound[0] - min_bound[0]) / self.grid_resolution,
             min_bound[1] + indices[1] * (max_bound[1] - min_bound[1]) / self.grid_resolution,
             min_bound[2] + indices[2] * (max_bound[2] - min_bound[2]) / self.grid_resolution,
         ], axis=-1)
+        
+        # Convert to world coordinates for visualization/comparison
+        points = self._denormalize_points(points_normalized)
         
         sdf_values = sdf_grid[indices]
         

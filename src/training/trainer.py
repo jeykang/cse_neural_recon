@@ -5,7 +5,7 @@ Main training loop and trainer class.
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 import numpy as np
 
 import torch
@@ -20,6 +20,14 @@ try:
     HAS_TENSORBOARD = True
 except ImportError:
     HAS_TENSORBOARD = False
+
+# Productivity metrics for DGX Spark evaluation
+try:
+    from ..utils.productivity_metrics import ProductivityMetricsCollector
+    HAS_PRODUCTIVITY_METRICS = True
+except ImportError:
+    HAS_PRODUCTIVITY_METRICS = False
+    ProductivityMetricsCollector = None
 
 
 @dataclass
@@ -43,15 +51,17 @@ class TrainingConfig:
     min_lr: float = 1e-6
     
     # Sampling
-    num_surface_samples: int = 4096
-    num_freespace_samples: int = 4096
-    freespace_jitter_min: float = 0.05
-    freespace_jitter_max: float = 0.5
+    num_surface_samples: int = 8192
+    num_freespace_samples: int = 8192
+    num_random_samples: int = 4096  # Random points in empty space
+    freespace_jitter_min: float = 0.1
+    freespace_jitter_max: float = 2.0  # Increased range for large scenes
     
     # Loss weights
     surface_weight: float = 1.0
-    freespace_weight: float = 0.5
-    eikonal_weight: float = 0.1
+    freespace_weight: float = 2.0  # Increased to better learn empty space
+    eikonal_weight: float = 0.05  # Reduced - was dominating
+    random_space_weight: float = 1.0  # For random space sampling
     planar_weight: float = 0.3
     normal_weight: float = 0.2
     manhattan_weight: float = 0.1
@@ -59,6 +69,10 @@ class TrainingConfig:
     # Training options
     use_amp: bool = True
     grad_clip: float = 1.0
+    
+    # Metrics collection (for cross-device comparison)
+    collect_metrics: bool = True  # Enable detailed metrics collection by default
+    metrics_sample_rate: int = 10  # Sample GPU metrics every N batches
     
     # Logging
     log_every: int = 100
@@ -100,6 +114,9 @@ class Trainer:
         self.train_loader = train_loader
         self.val_loader = val_loader
         
+        # Compute scene bounds from dataset for coordinate normalization
+        self._compute_scene_bounds()
+        
         # Setup optimizer
         self.optimizer = self._create_optimizer()
         self.scheduler = self._create_scheduler()
@@ -133,6 +150,135 @@ class Trainer:
         self._viz_batch = None
         self._gt_points = None
         
+        # Productivity metrics collection (enabled by default for cross-device comparison)
+        self.productivity_collector = None
+        if self.config.collect_metrics and HAS_PRODUCTIVITY_METRICS and ProductivityMetricsCollector is not None:
+            metrics_dir = os.path.join(self.config.output_dir, 'metrics', self.config.experiment_name)
+            self.productivity_collector = ProductivityMetricsCollector(
+                output_dir=metrics_dir,
+                sample_rate=self.config.metrics_sample_rate
+            )
+            print(f"[Metrics] Detailed metrics collection enabled (sample rate: every {self.config.metrics_sample_rate} batches)")
+            print(f"[Metrics] Reports will be saved to: {metrics_dir}")
+    
+    def _compute_scene_bounds(self):
+        """
+        Compute scene bounds from actual depth points in dataset.
+        
+        This samples batches and backprojects depth to get actual 3D point ranges,
+        then sets up normalization parameters to map coords to [0, 1].
+        """
+        print("Computing scene bounds from depth data...")
+        
+        # Collect backprojected points from depth maps
+        all_points = []
+        
+        # Sample a subset of batches
+        num_samples = min(50, len(self.train_loader))
+        
+        for i, batch in enumerate(self.train_loader):
+            if i >= num_samples:
+                break
+            
+            depth = batch['depth']  # (B, H, W)
+            pose = batch['pose']    # (B, 4, 4)
+            K = batch['K']          # (B, 3, 3)
+            
+            B, H, W = depth.shape
+            
+            # Create pixel grid
+            v, u = torch.meshgrid(
+                torch.arange(H, dtype=torch.float32),
+                torch.arange(W, dtype=torch.float32),
+                indexing='ij'
+            )
+            
+            for b in range(B):
+                d = depth[b]
+                valid = (d > 0.1) & (d < 30.0)  # Valid depth range
+                
+                if valid.sum() < 100:
+                    continue
+                
+                # Subsample for efficiency
+                valid_idx = torch.where(valid.flatten())[0]
+                sample_idx = valid_idx[torch.randperm(len(valid_idx))[:1000]]
+                
+                # Get intrinsics
+                fx, fy = K[b, 0, 0], K[b, 1, 1]
+                cx, cy = K[b, 0, 2], K[b, 1, 2]
+                
+                # Backproject sampled pixels
+                u_flat, v_flat = u.flatten(), v.flatten()
+                d_flat = d.flatten()
+                
+                u_s = u_flat[sample_idx]
+                v_s = v_flat[sample_idx]
+                d_s = d_flat[sample_idx]
+                
+                X = (u_s - cx) * d_s / fx
+                Y = (v_s - cy) * d_s / fy
+                Z = d_s
+                
+                pts_cam = torch.stack([X, Y, Z], dim=-1)
+                
+                # Transform to world
+                R = pose[b, :3, :3]
+                t = pose[b, :3, 3]
+                pts_world = (R @ pts_cam.T).T + t
+                
+                all_points.append(pts_world)
+        
+        if all_points:
+            all_points = torch.cat(all_points, dim=0)  # (N, 3)
+            
+            # Compute bounds with small padding
+            min_pt = all_points.min(dim=0)[0]
+            max_pt = all_points.max(dim=0)[0]
+            
+            # Add 5% padding
+            extent = max_pt - min_pt
+            padding = extent * 0.05
+            
+            self.scene_min = (min_pt - padding).to(self.device)
+            self.scene_max = (max_pt + padding).to(self.device)
+        else:
+            # Fallback to default bounds
+            self.scene_min = torch.tensor([-50.0, -50.0, -15.0], device=self.device)
+            self.scene_max = torch.tensor([50.0, 50.0, 15.0], device=self.device)
+        
+        scene_extent = self.scene_max - self.scene_min
+        print(f"Scene bounds: min={self.scene_min.cpu().numpy()}, max={self.scene_max.cpu().numpy()}")
+        print(f"Scene extent: {scene_extent.cpu().numpy()}")
+    
+    def _normalize_coords(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        Normalize world coordinates to [0, 1] range for the hash grid.
+        
+        Args:
+            coords: (*, 3) world coordinates
+            
+        Returns:
+            (*, 3) normalized coordinates in [0, 1]
+        """
+        # Map from [scene_min, scene_max] to [0, 1]
+        normalized = (coords - self.scene_min) / (self.scene_max - self.scene_min + 1e-8)
+        # Clamp to handle points slightly outside bounds
+        normalized = torch.clamp(normalized, 0.0, 1.0)
+        return normalized
+    
+    def _denormalize_coords(self, normalized: torch.Tensor) -> torch.Tensor:
+        """
+        Convert normalized [0, 1] coordinates back to world coordinates.
+        
+        Args:
+            normalized: (*, 3) normalized coordinates in [0, 1]
+            
+        Returns:
+            (*, 3) world coordinates
+        """
+        return normalized * (self.scene_max - self.scene_min) + self.scene_min
+        
     def _init_visualizer(self):
         """Initialize the training visualizer."""
         try:
@@ -142,6 +288,9 @@ class Trainer:
                 model=self.model,
                 device=self.device,
             )
+            # Pass scene bounds to visualizer if available
+            if hasattr(self, 'scene_min') and hasattr(self, 'scene_max'):
+                self.visualizer.set_scene_bounds(self.scene_min, self.scene_max)
             print("Visualization enabled - will generate point cloud comparisons")
         except Exception as e:
             print(f"Warning: Could not initialize visualizer: {e}")
@@ -208,14 +357,37 @@ class Trainer:
         print(f"Device: {self.device}")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
         
+        # Start productivity metrics collection
+        if self.productivity_collector is not None:
+            config_dict = {
+                'training': {
+                    'batch_size': self.config.batch_size,
+                    'learning_rate': self.config.learning_rate,
+                    'epochs': self.config.epochs,
+                }
+            }
+            self.productivity_collector.start_experiment(
+                self.model, 
+                config=config_dict,
+                model_name=self.model.__class__.__name__
+            )
+        
         # Cache visualization batch on first iteration
         self._cache_viz_batch()
         
         for epoch in range(self.current_epoch, self.config.epochs):
             self.current_epoch = epoch
             
+            # Track epoch timing
+            if self.productivity_collector is not None:
+                self.productivity_collector.start_epoch(epoch)
+            
             # Training epoch
             train_metrics = self.train_epoch()
+            
+            # End epoch timing
+            if self.productivity_collector is not None:
+                self.productivity_collector.end_epoch(epoch)
             
             # Validation
             val_metrics = {}
@@ -234,20 +406,44 @@ class Trainer:
                     
             # Checkpointing and Visualization
             if (epoch + 1) % self.config.save_every == 0:
+                ckpt_start = time.time()
                 self.save_checkpoint()
+                if self.productivity_collector is not None:
+                    self.productivity_collector.record_event('checkpoint_save', time.time() - ckpt_start)
                 
                 # Generate visualizations
                 if self.visualizer is not None:
-                    self._generate_visualizations(epoch, train_metrics, val_metrics)
+                    viz_start = time.time()
+                    eval_metrics = self._generate_visualizations(epoch, train_metrics, val_metrics)
+                    if self.productivity_collector is not None:
+                        self.productivity_collector.record_event('visualization', time.time() - viz_start)
+                        if epoch == self.config.save_every - 1 and self.productivity_collector.experiment_start:
+                            # First visualization - record time to first result
+                            self.productivity_collector.record_event('first_result', time.time() - self.productivity_collector.experiment_start)
+                        # Record quality metrics
+                        if eval_metrics and isinstance(eval_metrics, dict):
+                            for key, value in eval_metrics.items():
+                                self.productivity_collector.record_quality_metric(key, value)
                 
             # Best model
             val_loss = val_metrics.get('loss', train_metrics['loss'])
             if val_loss < self.best_val_loss:
                 self.best_val_loss = val_loss
                 self.save_checkpoint('best_model.pt')
+        
+        # Record final quality metrics
+        if self.productivity_collector is not None:
+            self.productivity_collector.record_quality_metric('loss', train_metrics.get('loss', 0))
                 
         # Final save
         self.save_checkpoint('final_model.pt')
+        
+        # End productivity metrics and generate report
+        if self.productivity_collector is not None:
+            self.productivity_collector.end_experiment()
+            report = self.productivity_collector.generate_report()
+            self.productivity_collector.save_report(report, f"productivity_{self.config.experiment_name}")
+            print(f"\n[Productivity] Report saved to {self.productivity_collector.output_dir}")
         
         if self.writer:
             self.writer.close()
@@ -270,11 +466,26 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc=f"Epoch {self.current_epoch}")
         
         for batch_idx, batch in enumerate(pbar):
+            # Start batch timing for productivity metrics
+            if self.productivity_collector is not None:
+                self.productivity_collector.start_batch()
+                self.productivity_collector.start_phase('data_load')
+            
             # Move batch to device
             batch = self._to_device(batch)
             
+            if self.productivity_collector is not None:
+                self.productivity_collector.start_phase('forward')
+            
             # Forward pass
             loss, components = self.train_step(batch)
+            
+            # End batch timing
+            if self.productivity_collector is not None:
+                batch_size = batch['depth'].shape[0] if 'depth' in batch else self.config.batch_size
+                self.productivity_collector.end_batch(
+                    self.current_epoch, batch_idx, batch_size, loss.item()
+                )
             
             # Accumulate metrics
             total_loss += loss.item()
@@ -302,7 +513,12 @@ class Trainer:
         
     def train_step(self, batch: Dict[str, torch.Tensor]) -> tuple:
         """
-        Single training step.
+        Single training step with proper TSDF supervision.
+        
+        Implements depth-based SDF supervision following MonoSDF/NeuS approaches:
+        - Sample points along camera rays at multiple depths
+        - Compute truncated SDF targets from depth measurements
+        - Use proper inside/outside supervision
         
         Args:
             batch: Dictionary containing batch data
@@ -321,55 +537,93 @@ class Trainer:
         
         B, H, W = depth.shape
         
-        # Sample surface points
-        surface_points, camera_centers = self._sample_surface_points(
+        # Scene scale for normalizing SDF targets
+        scene_scale = (self.scene_max - self.scene_min).mean().item()
+        
+        # Truncation distance in world units (for TSDF)
+        truncation_dist = 0.1  # 10cm in world coordinates
+        truncation_normalized = truncation_dist / scene_scale
+        
+        # Sample TSDF points along rays (key to learning proper SDF)
+        tsdf_points_world, tsdf_targets = self._sample_tsdf_points(
+            depth, pose, K, valid_mask, truncation_dist
+        )
+        
+        # Sample surface points (SDF = 0)
+        surface_points_world, camera_centers = self._sample_surface_points(
             depth, pose, K, valid_mask
         )
         
-        # Sample freespace points
-        freespace_points, freespace_targets = self._sample_freespace_points(
-            surface_points, camera_centers
-        )
+        # Sample random far-field points (positive SDF, far from surface)
+        far_points_world = self._sample_random_space_points(B)
+        
+        # Normalize all coordinates to [0, 1]
+        tsdf_points = self._normalize_coords(tsdf_points_world)
+        surface_points = self._normalize_coords(surface_points_world)
+        far_points = self._normalize_coords(far_points_world)
+        
+        # Normalize SDF targets
+        tsdf_targets_normalized = tsdf_targets / scene_scale
         
         # Forward pass with mixed precision
         with autocast(enabled=self.config.use_amp):
+            # TSDF points (most important for geometry)
+            tsdf_out = self.model(tsdf_points)
+            sdf_tsdf = tsdf_out['sdf'].squeeze(-1)  # (B, N)
+            
             # Surface points
             surface_out = self.model(surface_points)
             sdf_surface = surface_out['sdf']
             
-            # Freespace points
-            freespace_out = self.model(freespace_points)
-            sdf_freespace = freespace_out['sdf']
+            # Far-field points (should have large positive SDF)
+            far_out = self.model(far_points)
+            sdf_far = far_out['sdf']
             
-            # Compute gradients for Eikonal loss
-            all_points = torch.cat([surface_points, freespace_points], dim=1)
-            all_points = all_points.requires_grad_(True)
-            all_out = self.model(all_points)
-            all_sdf = all_out['sdf']
+            # === TSDF Loss (most important) ===
+            # L1 loss on truncated SDF values
+            loss_tsdf = torch.abs(sdf_tsdf - tsdf_targets_normalized).mean()
+            
+            # === Surface Loss ===
+            # Surface points should have SDF = 0
+            loss_surface = torch.abs(sdf_surface).mean()
+            
+            # === Far-field Loss ===
+            # Far points should have positive SDF (outside surface)
+            # Use exponential barrier: encourage large positive values
+            min_far_sdf = 0.1  # Minimum expected SDF for far points (normalized)
+            loss_far = torch.relu(min_far_sdf - sdf_far).mean()
+        
+        # === Eikonal Loss (outside AMP for stability) ===
+        if self.config.eikonal_weight > 0:
+            num_eikonal_points = min(2048, surface_points.shape[1])
+            eikonal_points = surface_points[:, :num_eikonal_points].clone()
+            eikonal_points.requires_grad_(True)
+            
+            eikonal_out = self.model(eikonal_points)
+            eikonal_sdf = eikonal_out['sdf']
             
             gradients = torch.autograd.grad(
-                outputs=all_sdf,
-                inputs=all_points,
-                grad_outputs=torch.ones_like(all_sdf),
+                outputs=eikonal_sdf,
+                inputs=eikonal_points,
+                grad_outputs=torch.ones_like(eikonal_sdf),
                 create_graph=True,
                 retain_graph=True
             )[0]
             
-            # Compute losses
-            loss_surface = torch.abs(sdf_surface).mean()
-            loss_freespace = torch.abs(
-                sdf_freespace.squeeze(-1) - freespace_targets
-            ).mean()
-            
             grad_norm = torch.norm(gradients, dim=-1)
+            grad_norm = torch.clamp(grad_norm, 0, 10)
             loss_eikonal = ((grad_norm - 1.0) ** 2).mean()
-            
-            # Total loss
-            loss = (
-                self.config.surface_weight * loss_surface +
-                self.config.freespace_weight * loss_freespace +
-                self.config.eikonal_weight * loss_eikonal
-            )
+        else:
+            loss_eikonal = torch.tensor(0.0, device=self.device)
+        
+        # Total loss with proper weighting
+        # TSDF is the primary supervision, surface is regularization
+        loss = (
+            2.0 * loss_tsdf +  # Primary TSDF supervision
+            self.config.surface_weight * loss_surface +
+            0.5 * loss_far +  # Encourage positive SDF in empty space
+            self.config.eikonal_weight * loss_eikonal
+        )
             
         # Backward pass
         if self.scaler is not None:
@@ -394,10 +648,125 @@ class Trainer:
             self.optimizer.step()
             
         components = {
+            'tsdf': loss_tsdf.item(),
             'surface': loss_surface.item(),
-            'freespace': loss_freespace.item(),
+            'far': loss_far.item(),
             'eikonal': loss_eikonal.item(),
         }
+        
+        return loss, components
+    
+    def _sample_tsdf_points(
+        self,
+        depth: torch.Tensor,
+        pose: torch.Tensor,
+        K: torch.Tensor,
+        valid_mask: torch.Tensor,
+        truncation: float
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Sample points along camera rays with TSDF targets.
+        
+        For each valid depth pixel:
+        - Sample points in front of and behind the surface
+        - Compute SDF as signed distance to surface along ray
+        - Truncate to [-truncation, truncation]
+        
+        Args:
+            depth: (B, H, W) depth maps
+            pose: (B, 4, 4) camera poses
+            K: (B, 3, 3) intrinsics
+            valid_mask: (B, H, W) valid depth mask
+            truncation: Truncation distance in world units
+            
+        Returns:
+            points: (B, N, 3) sampled points in world coordinates
+            targets: (B, N) truncated SDF targets
+        """
+        B, H, W = depth.shape
+        device = depth.device
+        
+        # Number of rays to sample per image
+        num_rays = self.config.num_surface_samples // 4
+        # Number of depth samples per ray
+        num_depth_samples = 8
+        
+        all_points = []
+        all_targets = []
+        
+        for b in range(B):
+            # Get valid pixels
+            valid_idx = torch.where(valid_mask[b].flatten())[0]
+            
+            if len(valid_idx) < num_rays:
+                # Not enough valid pixels, sample with replacement
+                ray_idx = valid_idx[torch.randint(len(valid_idx), (num_rays,), device=device)]
+            else:
+                ray_idx = valid_idx[torch.randperm(len(valid_idx), device=device)[:num_rays]]
+            
+            # Convert flat indices to 2D
+            v = ray_idx // W
+            u = ray_idx % W
+            
+            # Get depths at selected pixels
+            ray_depths = depth[b, v, u]  # (num_rays,)
+            
+            # Get camera parameters
+            K_b = K[b]  # (3, 3)
+            pose_b = pose[b]  # (4, 4)
+            R = pose_b[:3, :3]
+            t = pose_b[:3, 3]
+            
+            # Compute ray directions in camera frame
+            fx, fy = K_b[0, 0], K_b[1, 1]
+            cx, cy = K_b[0, 2], K_b[1, 2]
+            
+            # Ray directions in camera frame
+            ray_dirs_cam = torch.stack([
+                (u.float() - cx) / fx,
+                (v.float() - cy) / fy,
+                torch.ones(num_rays, device=device)
+            ], dim=-1)  # (num_rays, 3)
+            ray_dirs_cam = ray_dirs_cam / torch.norm(ray_dirs_cam, dim=-1, keepdim=True)
+            
+            # Transform to world frame
+            ray_dirs_world = (R @ ray_dirs_cam.T).T  # (num_rays, 3)
+            
+            # Sample depths: from (surface_depth - truncation) to (surface_depth + truncation)
+            depth_offsets = torch.linspace(-truncation, truncation, num_depth_samples, device=device)
+            
+            # Sample points along each ray
+            # ray_depths: (num_rays,), depth_offsets: (num_depth_samples,)
+            sample_depths = ray_depths.unsqueeze(1) + depth_offsets.unsqueeze(0)  # (num_rays, num_depth_samples)
+            sample_depths = torch.clamp(sample_depths, min=0.1)  # Avoid negative depths
+            
+            # Compute 3D points: camera_pos + depth * ray_dir
+            # sample_depths: (num_rays, num_depth_samples)
+            # ray_dirs_world: (num_rays, 3)
+            points = t.unsqueeze(0).unsqueeze(0) + \
+                     sample_depths.unsqueeze(-1) * ray_dirs_world.unsqueeze(1)
+            # points: (num_rays, num_depth_samples, 3)
+            
+            # Compute SDF targets: signed distance to surface along ray
+            # Negative = inside (behind surface), Positive = outside (in front of surface)
+            # Note: SDF convention - positive outside, negative inside
+            sdf_targets = -depth_offsets.unsqueeze(0).expand(num_rays, -1)  # (num_rays, num_depth_samples)
+            
+            # Truncate
+            sdf_targets = torch.clamp(sdf_targets, -truncation, truncation)
+            
+            # Flatten
+            points = points.view(-1, 3)  # (num_rays * num_depth_samples, 3)
+            sdf_targets = sdf_targets.view(-1)  # (num_rays * num_depth_samples,)
+            
+            all_points.append(points)
+            all_targets.append(sdf_targets)
+        
+        # Stack batches
+        all_points = torch.stack([p for p in all_points], dim=0)  # (B, N, 3)
+        all_targets = torch.stack([t for t in all_targets], dim=0)  # (B, N)
+        
+        return all_points, all_targets
         
         return loss, components
         
@@ -494,6 +863,34 @@ class Trainer:
         freespace_targets = jitter.squeeze(-1)
         
         return freespace_points, freespace_targets
+    
+    def _sample_random_space_points(self, batch_size: int) -> torch.Tensor:
+        """
+        Sample random points throughout the scene volume.
+        
+        These points should mostly be in empty space (outside surfaces),
+        helping the model learn positive SDF values for empty regions.
+        
+        Args:
+            batch_size: Number of samples per batch item
+            
+        Returns:
+            random_points: (B, N, 3) random world coordinates
+        """
+        N = self.config.num_random_samples
+        
+        # Sample uniformly in the scene bounding box (world coordinates)
+        random_points = torch.rand(
+            batch_size, N, 3, 
+            device=self.device, 
+            dtype=torch.float32
+        )
+        
+        # Scale to scene bounds
+        scene_extent = self.scene_max - self.scene_min
+        random_points = random_points * scene_extent + self.scene_min
+        
+        return random_points
         
     @torch.no_grad()
     def validate(self) -> Dict[str, float]:
@@ -517,9 +914,12 @@ class Trainer:
             K = batch['K']
             valid_mask = batch.get('valid_mask', depth > 0)
             
-            surface_points, camera_centers = self._sample_surface_points(
+            surface_points_world, camera_centers = self._sample_surface_points(
                 depth, pose, K, valid_mask
             )
+            
+            # Normalize coordinates for model
+            surface_points = self._normalize_coords(surface_points_world)
             
             surface_out = self.model(surface_points)
             sdf_surface = surface_out['sdf']
@@ -613,31 +1013,79 @@ class Trainer:
         print(f"Loaded checkpoint from {path} (epoch {self.current_epoch})")
 
     def _cache_viz_batch(self):
-        """Cache a sample batch for consistent visualization across epochs."""
+        """Cache ground truth points from across the entire dataset."""
         try:
-            # Get first batch from training loader
-            for batch in self.train_loader:
-                self._viz_batch = {k: v.clone() if torch.is_tensor(v) else v 
-                                   for k, v in batch.items()}
-                break
+            # Sample GT points from multiple batches across the dataset
+            print("Caching GT points from across dataset...")
+            all_points = []
+            max_batches = min(100, len(self.train_loader))  # Sample up to 100 batches
             
-            # Generate ground truth point cloud from cached batch
-            if self._viz_batch is not None and self.visualizer is not None:
-                try:
-                    from .visualizer import generate_gt_point_cloud_from_batch
-                    self._gt_points = generate_gt_point_cloud_from_batch(self._viz_batch)
+            for i, batch in enumerate(self.train_loader):
+                if i >= max_batches:
+                    break
+                
+                # Only cache the first batch for visualization
+                if i == 0:
+                    self._viz_batch = {k: v.clone() if torch.is_tensor(v) else v 
+                                       for k, v in batch.items()}
+                
+                # Extract points from this batch
+                depth = batch['depth']
+                pose = batch['pose']
+                K = batch['K']
+                valid_mask = batch.get('valid_mask', depth > 0)
+                
+                B, H, W = depth.shape
+                
+                for b in range(B):
+                    valid = valid_mask[b]
+                    v, u = torch.where(valid)
                     
-                    if len(self._gt_points) > 0:
-                        print(f"Cached visualization batch with {len(self._gt_points)} GT points")
-                    else:
-                        print("Note: No valid depth data in batch - will show predictions only")
-                        self._gt_points = None
-                except Exception as e:
-                    print(f"Warning: Could not generate GT points: {e}")
-                    self._gt_points = None
+                    if len(v) < 100:
+                        continue
+                    
+                    # Subsample each frame
+                    sample_idx = torch.randperm(len(v))[:1000]
+                    v, u = v[sample_idx], u[sample_idx]
+                    z = depth[b, v, u]
+                    
+                    # Back-project
+                    fx, fy = K[b, 0, 0], K[b, 1, 1]
+                    cx, cy = K[b, 0, 2], K[b, 1, 2]
+                    
+                    x = (u.float() - cx) * z / fx
+                    y = (v.float() - cy) * z / fy
+                    
+                    pts_cam = torch.stack([x, y, z], dim=-1)
+                    
+                    # Transform to world
+                    R = pose[b, :3, :3]
+                    t = pose[b, :3, 3]
+                    pts_world = pts_cam @ R.T + t
+                    
+                    all_points.append(pts_world.cpu().numpy())
+            
+            if all_points:
+                self._gt_points = np.concatenate(all_points, axis=0)
+                
+                # Subsample to reasonable size
+                max_points = 100000
+                if len(self._gt_points) > max_points:
+                    indices = np.random.choice(len(self._gt_points), max_points, replace=False)
+                    self._gt_points = self._gt_points[indices]
+                
+                print(f"Cached {len(self._gt_points)} GT points from {max_batches} batches")
+                print(f"GT point range: X=[{self._gt_points[:, 0].min():.1f}, {self._gt_points[:, 0].max():.1f}], "
+                      f"Y=[{self._gt_points[:, 1].min():.1f}, {self._gt_points[:, 1].max():.1f}], "
+                      f"Z=[{self._gt_points[:, 2].min():.1f}, {self._gt_points[:, 2].max():.1f}]")
+            else:
+                print("Warning: No valid GT points found")
+                self._gt_points = None
                     
         except Exception as e:
             print(f"Warning: Could not cache visualization batch: {e}")
+            import traceback
+            traceback.print_exc()
             self._viz_batch = None
             self._gt_points = None
     
