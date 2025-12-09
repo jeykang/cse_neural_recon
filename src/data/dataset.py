@@ -10,12 +10,68 @@ import glob
 import json
 import numpy as np
 import torch
-from torch.utils.data import Dataset
+from torch.utils.data import Dataset, ConcatDataset
 from PIL import Image
 from scipy.spatial.transform import Rotation as R
 from scipy.interpolate import interp1d
 from typing import Dict, List, Optional, Tuple, Union
 import cv2
+
+
+def create_multi_sequence_dataset(
+    base_dir: str,
+    sequences: Optional[List[str]] = None,
+    pattern: str = "static_*",
+    **kwargs
+) -> Dataset:
+    """
+    Create a combined dataset from multiple sequences.
+    
+    This allows training on data from multiple robot trajectories
+    to get better scene coverage.
+    
+    Args:
+        base_dir: Base directory containing sequence folders
+        sequences: List of sequence names, or None to use pattern
+        pattern: Glob pattern to find sequences if sequences is None
+        **kwargs: Arguments passed to CSEDataset
+        
+    Returns:
+        Combined dataset (ConcatDataset of CSEDatasets)
+    """
+    if sequences is None:
+        # Find sequences matching pattern
+        import glob
+        seq_dirs = sorted(glob.glob(os.path.join(base_dir, pattern)))
+        sequences = [os.path.basename(d) for d in seq_dirs if os.path.isdir(d)]
+    
+    if not sequences:
+        raise ValueError(f"No sequences found in {base_dir} matching {pattern}")
+    
+    datasets = []
+    total_frames = 0
+    
+    for seq_name in sequences:
+        seq_path = os.path.join(base_dir, seq_name)
+        if not os.path.isdir(seq_path):
+            print(f"Warning: Sequence {seq_name} not found, skipping")
+            continue
+            
+        try:
+            ds = CSEDataset(run_dir=seq_path, **kwargs)
+            datasets.append(ds)
+            total_frames += len(ds)
+            print(f"  Loaded {seq_name}: {len(ds)} frames")
+        except Exception as e:
+            print(f"Warning: Failed to load {seq_name}: {e}")
+    
+    if not datasets:
+        raise ValueError(f"No valid sequences found in {base_dir}")
+    
+    combined = ConcatDataset(datasets)
+    print(f"Combined dataset: {total_frames} frames from {len(datasets)} sequences")
+    
+    return combined
 
 
 class CSEDataset(Dataset):

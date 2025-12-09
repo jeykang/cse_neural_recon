@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 from datetime import datetime
@@ -21,7 +22,7 @@ import torch.nn as nn
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data import CSEDataset
+from src.data import CSEDataset, create_multi_sequence_dataset
 from src.models import NeuralSDF, NeuralSDFWithPlanar, HashGridSDF
 from src.losses import SDFLoss, PlanarConsistencyLoss, ManhattanLoss
 from src.training import Trainer, TrainingConfig
@@ -159,8 +160,11 @@ def create_model(config: dict, device: str = 'cuda') -> nn.Module:
     return model.to(device)
 
 
-def create_dataset(config: dict) -> CSEDataset:
-    """Create dataset from config."""
+def create_dataset(config: dict):
+    """Create dataset from config.
+    
+    Supports single sequence or multi-sequence training.
+    """
     data_config = config.get('data', {})
     
     # Get data path
@@ -176,9 +180,8 @@ def create_dataset(config: dict) -> CSEDataset:
     # CSE dataset depth is in mm (uint16), need to scale to meters
     depth_scale = data_config.get('depth_scale', 0.001)
     
-    # Create dataset
-    dataset = CSEDataset(
-        run_dir=str(data_path),
+    # Common dataset kwargs
+    dataset_kwargs = dict(
         side=data_config.get('side', 'left'),
         img_wh=(img_width, img_height),
         min_depth=min_depth,
@@ -186,6 +189,29 @@ def create_dataset(config: dict) -> CSEDataset:
         depth_scale=depth_scale,
         cache_frames=data_config.get('cache_frames', False),
     )
+    
+    # Check for multi-sequence training
+    multi_sequence = data_config.get('multi_sequence', False)
+    sequences = data_config.get('sequences', None)
+    sequence_pattern = data_config.get('sequence_pattern', 'static_*')
+    
+    if multi_sequence:
+        # Multi-sequence mode: combine multiple trajectories
+        base_dir = data_config.get('base_dir', data_path)
+        if not os.path.isdir(base_dir):
+            # data_path might be a specific sequence - use its parent
+            base_dir = os.path.dirname(data_path)
+        
+        print(f"Loading multi-sequence dataset from {base_dir}")
+        dataset = create_multi_sequence_dataset(
+            base_dir=base_dir,
+            sequences=sequences,
+            pattern=sequence_pattern,
+            **dataset_kwargs
+        )
+    else:
+        # Single sequence mode
+        dataset = CSEDataset(run_dir=str(data_path), **dataset_kwargs)
     
     return dataset
 

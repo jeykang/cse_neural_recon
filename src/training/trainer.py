@@ -538,15 +538,17 @@ class Trainer:
         B, H, W = depth.shape
         
         # Scene scale for normalizing SDF targets
-        scene_scale = (self.scene_max - self.scene_min).mean().item()
+        scene_extent = self.scene_max - self.scene_min
+        scene_scale = scene_extent.mean().item()
         
-        # Truncation distance in world units (for TSDF)
-        truncation_dist = 0.1  # 10cm in world coordinates
-        truncation_normalized = truncation_dist / scene_scale
+        # Truncation distance in NORMALIZED coordinates
+        # Use 1% of scene size for truncation band
+        truncation_normalized = 0.02  # 2% of normalized [0,1] space
+        truncation_world = truncation_normalized * scene_scale
         
         # Sample TSDF points along rays (key to learning proper SDF)
-        tsdf_points_world, tsdf_targets = self._sample_tsdf_points(
-            depth, pose, K, valid_mask, truncation_dist
+        tsdf_points_world, tsdf_targets_world = self._sample_tsdf_points(
+            depth, pose, K, valid_mask, truncation_world
         )
         
         # Sample surface points (SDF = 0)
@@ -562,8 +564,9 @@ class Trainer:
         surface_points = self._normalize_coords(surface_points_world)
         far_points = self._normalize_coords(far_points_world)
         
-        # Normalize SDF targets
-        tsdf_targets_normalized = tsdf_targets / scene_scale
+        # Normalize SDF targets to same scale as coordinates
+        # This ensures TSDF targets are in [-truncation_normalized, +truncation_normalized]
+        tsdf_targets = tsdf_targets_world / scene_scale
         
         # Forward pass with mixed precision
         with autocast(enabled=self.config.use_amp):
@@ -581,7 +584,7 @@ class Trainer:
             
             # === TSDF Loss (most important) ===
             # L1 loss on truncated SDF values
-            loss_tsdf = torch.abs(sdf_tsdf - tsdf_targets_normalized).mean()
+            loss_tsdf = torch.abs(sdf_tsdf - tsdf_targets).mean()
             
             # === Surface Loss ===
             # Surface points should have SDF = 0
@@ -589,8 +592,8 @@ class Trainer:
             
             # === Far-field Loss ===
             # Far points should have positive SDF (outside surface)
-            # Use exponential barrier: encourage large positive values
-            min_far_sdf = 0.1  # Minimum expected SDF for far points (normalized)
+            # Use same scale as TSDF - want far field to be beyond truncation
+            min_far_sdf = truncation_normalized * 2  # Twice the truncation distance
             loss_far = torch.relu(min_far_sdf - sdf_far).mean()
         
         # === Eikonal Loss (outside AMP for stability) ===
