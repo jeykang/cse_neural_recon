@@ -8,8 +8,8 @@
 #   # Train on GPU 0 (default)
 #   docker compose up train
 #
-#   # Train on specific GPU
-#   CUDA_VISIBLE_DEVICES=1 docker compose up train
+#   # Train on specific GPU (e.g., GPU 1)
+#   GPU_ID=1 docker compose up train
 #
 #   # Run comparison benchmark
 #   docker compose up benchmark
@@ -40,7 +40,8 @@ services:
       - PYTHONPATH=/workspace
       - PYTHONUNBUFFERED=1
       # NVIDIA Container Runtime
-      - NVIDIA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all}
+      - NVIDIA_VISIBLE_DEVICES=${GPU_ID:-all}
+      - CUDA_VISIBLE_DEVICES=0
       - NVIDIA_DRIVER_CAPABILITIES=compute,utility
     # Resource limits (adjust based on your system)
     shm_size: '16gb'  # Shared memory for DataLoader workers
@@ -60,7 +61,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ['${GPU_ID:-0}']
               capabilities: [gpu]
     command: >
       python scripts/train.py 
@@ -76,7 +77,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ['${GPU_ID:-0}']
               capabilities: [gpu]
     command: >
       python scripts/train.py 
@@ -92,7 +93,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ['${GPU_ID:-0}']
               capabilities: [gpu]
     command: >
       python scripts/benchmark_productivity.py 
@@ -123,7 +124,7 @@ services:
         reservations:
           devices:
             - driver: nvidia
-              count: 1
+              device_ids: ['${GPU_ID:-0}']
               capabilities: [gpu]
     command: /bin/bash
 
