@@ -68,6 +68,25 @@ services:
       --config config/experiment/cse_warehouse.yaml
       ${TRAIN_ARGS:-}
 
+  # Training with auto batch size scaling (recommended for portability)
+  train-auto:
+    <<: *base
+    container_name: neural_recon_train_auto
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ['${GPU_ID:-0}']
+              capabilities: [gpu]
+    command: >
+      python scripts/train.py 
+      --config config/experiment/cse_warehouse.yaml
+      --auto-batch-size
+      --target-memory ${TARGET_MEMORY:-0.80}
+      --max-batch-size ${MAX_BATCH:-64}
+      ${TRAIN_ARGS:-}
+
   # Training with specific epochs (for testing)
   train-quick:
     <<: *base

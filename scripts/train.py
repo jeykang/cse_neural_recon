@@ -26,6 +26,7 @@ from src.data import CSEDataset, create_multi_sequence_dataset
 from src.models import NeuralSDF, NeuralSDFWithPlanar, HashGridSDF
 from src.losses import SDFLoss, PlanarConsistencyLoss, ManhattanLoss
 from src.training import Trainer, TrainingConfig
+from src.utils.auto_batch_size import auto_batch_size_for_sdf, get_gpu_memory_info
 
 
 def setup_logging(output_dir: Path, name: str = 'train'):
@@ -303,6 +304,12 @@ def main():
                         help='Device to use')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed')
+    parser.add_argument('--auto-batch-size', action='store_true',
+                        help='Automatically determine optimal batch size for GPU')
+    parser.add_argument('--target-memory', type=float, default=0.80,
+                        help='Target GPU memory utilization (0.0-1.0) for auto batch sizing')
+    parser.add_argument('--max-batch-size', type=int, default=64,
+                        help='Maximum batch size to try when auto-scaling')
     args = parser.parse_args()
     
     # Set seed
@@ -349,6 +356,59 @@ def main():
     param_count = sum(p.numel() for p in model.parameters())
     logger.info(f"Model parameters: {param_count:,}")
     
+    # Auto batch size scaling
+    train_config = config.get('training', {})
+    auto_batch = getattr(args, 'auto_batch_size', False)
+    
+    if auto_batch and torch.cuda.is_available():
+        logger.info("=" * 60)
+        logger.info("Auto batch size scaling enabled")
+        total_gb, available_gb = get_gpu_memory_info(torch.device(device))
+        logger.info(f"GPU Memory: {available_gb:.1f} GB available / {total_gb:.1f} GB total")
+        
+        # Get sampling parameters for memory profiling
+        num_points = (
+            train_config.get('num_surface_samples', 8192) +
+            train_config.get('num_freespace_samples', 8192) +
+            train_config.get('num_random_samples', 4096)
+        )
+        
+        logger.info(f"Profiling with {num_points:,} points per sample...")
+        logger.info(f"Target memory utilization: {args.target_memory * 100:.0f}%")
+        
+        try:
+            memory_profile = auto_batch_size_for_sdf(
+                model=model,
+                num_points_per_sample=num_points,
+                min_batch_size=1,
+                max_batch_size=args.max_batch_size,
+                target_memory_fraction=args.target_memory,
+                device=torch.device(device),
+                verbose=True,
+            )
+            
+            optimal_batch_size = memory_profile.recommended_batch_size
+            logger.info(f"Recommended batch size: {optimal_batch_size}")
+            logger.info(f"Memory per sample: {memory_profile.memory_per_sample_mb:.1f} MB")
+            logger.info(f"Model memory: {memory_profile.model_memory_mb:.1f} MB")
+            
+            # Update config with optimal batch size
+            if 'training' not in config:
+                config['training'] = {}
+            config['training']['batch_size'] = optimal_batch_size
+            train_config['batch_size'] = optimal_batch_size
+            
+            # Save updated config
+            with open(output_dir / 'config.yaml', 'w') as f:
+                yaml.dump(config, f)
+            
+            logger.info(f"Batch size set to: {optimal_batch_size}")
+        except Exception as e:
+            logger.warning(f"Auto batch size detection failed: {e}")
+            logger.info("Falling back to config batch size")
+        
+        logger.info("=" * 60)
+    
     # Create dataset and dataloader
     logger.info("Creating dataset...")
     try:
@@ -362,9 +422,7 @@ def main():
         train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=4, shuffle=True)
         logger.info("Using dummy dataset with 100 samples")
     
-    # Create training configuration
-    train_config = config.get('training', {})
-    
+    # Create training configuration (train_config was already loaded above)
     training_config = TrainingConfig(
         epochs=int(train_config.get('epochs', 50)),
         batch_size=int(train_config.get('batch_size', 8)),
