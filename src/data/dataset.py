@@ -350,7 +350,9 @@ class CSEDataset(Dataset):
         if 'depth' in frame:
             depth = Image.open(frame['depth'])
             depth = depth.resize(self.img_wh, Image.NEAREST)
-            depth = torch.from_numpy(np.array(depth)).float()
+            # Convert to int32 first (uint16 not supported by all PyTorch versions)
+            depth_arr = np.array(depth).astype(np.int32)
+            depth = torch.from_numpy(depth_arr).float()
             
             # Apply depth scale
             depth = depth * self.depth_scale
