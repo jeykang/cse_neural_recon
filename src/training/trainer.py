@@ -165,11 +165,42 @@ class Trainer:
         """
         Compute scene bounds from actual depth points in dataset.
         
-        This samples batches and backprojects depth to get actual 3D point ranges,
-        then sets up normalization parameters to map coords to [0, 1].
-        """
-        print("Computing scene bounds from depth data...")
+        If the dataset has a UnifiedCoordinateSystem attached (from multi-environment
+        loading), use that for per-environment normalization. Otherwise, compute
+        bounds by sampling depth points.
         
+        This sets up normalization parameters to map coords to [0, 1] or [-1, 1].
+        """
+        # Check if dataset has a coordinate system attached (multi-environment mode)
+        dataset = self.train_loader.dataset
+        
+        if hasattr(dataset, 'coordinate_system') and dataset.coordinate_system is not None:
+            print("Using unified coordinate system from dataset")
+            self.coordinate_system = dataset.coordinate_system
+            self.use_unified_coords = True
+            
+            # For compatibility, set scene_min/max from global bounds
+            global_bounds = self.coordinate_system.global_bounds
+            self.scene_min = torch.tensor(global_bounds.min_bounds, device=self.device).float()
+            self.scene_max = torch.tensor(global_bounds.max_bounds, device=self.device).float()
+            
+            print(f"Global scene bounds from {len(self.coordinate_system.environments)} environments:")
+            for env_name, bounds in self.coordinate_system.environments.items():
+                print(f"  {env_name}: center=({bounds.center[0]:.1f}, {bounds.center[1]:.1f}, {bounds.center[2]:.1f}), scale={bounds.scale:.1f}m")
+        else:
+            print("Computing scene bounds from depth data...")
+            self.coordinate_system = None
+            self.use_unified_coords = False
+            self._compute_scene_bounds_from_depth()
+        
+        scene_extent = self.scene_max - self.scene_min
+        print(f"Scene bounds: min={self.scene_min.cpu().numpy()}, max={self.scene_max.cpu().numpy()}")
+        print(f"Scene extent: {scene_extent.cpu().numpy()}")
+    
+    def _compute_scene_bounds_from_depth(self):
+        """
+        Compute scene bounds by backprojecting depth samples.
+        """
         # Collect backprojected points from depth maps
         all_points = []
         
@@ -246,10 +277,6 @@ class Trainer:
             # Fallback to default bounds
             self.scene_min = torch.tensor([-50.0, -50.0, -15.0], device=self.device)
             self.scene_max = torch.tensor([50.0, 50.0, 15.0], device=self.device)
-        
-        scene_extent = self.scene_max - self.scene_min
-        print(f"Scene bounds: min={self.scene_min.cpu().numpy()}, max={self.scene_max.cpu().numpy()}")
-        print(f"Scene extent: {scene_extent.cpu().numpy()}")
     
     def _normalize_coords(self, coords: torch.Tensor) -> torch.Tensor:
         """

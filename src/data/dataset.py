@@ -74,6 +74,130 @@ def create_multi_sequence_dataset(
     return combined
 
 
+def create_multi_environment_dataset(
+    environments: List[Dict],
+    compute_unified_coords: bool = True,
+    coord_system_path: Optional[str] = None,
+    **kwargs
+) -> Dataset:
+    """
+    Create a combined dataset from multiple environments.
+    
+    Each environment can have multiple sequences (static and dynamic).
+    This provides maximum data diversity for robust model training.
+    
+    When compute_unified_coords=True, computes per-environment bounds
+    so that all points can be normalized to [-1, 1] for training.
+    This allows the model to learn scale-invariant geometry.
+    
+    Args:
+        environments: List of dicts with 'base_dir' and optional 'sequences' or 'pattern'
+            Example: [
+                {'base_dir': 'data/warehouse_extracted', 'sequences': ['static_warehouse_robot1']},
+                {'base_dir': 'data/hospital_extracted', 'pattern': 'static_*'},
+            ]
+        compute_unified_coords: Whether to compute unified coordinate system
+        coord_system_path: Path to save/load coordinate system JSON
+        **kwargs: Arguments passed to CSEDataset
+        
+    Returns:
+        Combined dataset (ConcatDataset across all environments and sequences)
+        The dataset has a .coordinate_system attribute if compute_unified_coords=True
+    """
+    from .coordinate_system import UnifiedCoordinateSystem
+    
+    all_datasets = []
+    env_to_datasets = {}  # Track which datasets belong to which environment
+    total_frames = 0
+    
+    print("=" * 60)
+    print("MULTI-ENVIRONMENT DATASET LOADING")
+    print("=" * 60)
+    
+    for env in environments:
+        base_dir = env['base_dir']
+        sequences = env.get('sequences', None)
+        pattern = env.get('pattern', '*')
+        
+        # Extract environment name from base_dir
+        env_name = os.path.basename(base_dir).replace('_extracted', '')
+        
+        print(f"\nEnvironment: {base_dir} ({env_name})")
+        
+        if sequences is None:
+            # Find sequences matching pattern
+            seq_dirs = sorted(glob.glob(os.path.join(base_dir, pattern)))
+            sequences = [os.path.basename(d) for d in seq_dirs if os.path.isdir(d)]
+        
+        if not sequences:
+            print(f"  Warning: No sequences found matching pattern '{pattern}'")
+            continue
+        
+        env_frames = 0
+        env_datasets = []
+        
+        for seq_name in sequences:
+            seq_path = os.path.join(base_dir, seq_name)
+            if not os.path.isdir(seq_path):
+                print(f"  Warning: Sequence {seq_name} not found, skipping")
+                continue
+                
+            try:
+                ds = CSEDataset(run_dir=seq_path, **kwargs)
+                # Store environment name in dataset for coordinate lookup
+                ds.environment_name = env_name
+                all_datasets.append(ds)
+                env_datasets.append(ds)
+                env_frames += len(ds)
+                total_frames += len(ds)
+                print(f"  ✓ {seq_name}: {len(ds)} frames")
+            except Exception as e:
+                print(f"  ✗ {seq_name}: Failed - {e}")
+        
+        env_to_datasets[env_name] = env_datasets
+        print(f"  Subtotal: {env_frames} frames from {len(sequences)} sequences")
+    
+    if not all_datasets:
+        raise ValueError("No valid datasets found across any environment")
+    
+    # Compute unified coordinate system if requested
+    coord_system = None
+    if compute_unified_coords:
+        print("\nComputing unified coordinate system...")
+        coord_system = UnifiedCoordinateSystem(normalize_mode='per_environment')
+        
+        # Try to load existing coord system
+        if coord_system_path and os.path.exists(coord_system_path):
+            coord_system = UnifiedCoordinateSystem.load(coord_system_path)
+        else:
+            # Compute bounds for each environment
+            for env_name, datasets in env_to_datasets.items():
+                seq_dirs = [ds.run_dir for ds in datasets]
+                coord_system.compute_environment_bounds(env_name, seq_dirs[:3])  # Sample first 3
+            
+            coord_system.compute_global_bounds()
+            
+            # Save for later use
+            if coord_system_path:
+                os.makedirs(os.path.dirname(coord_system_path), exist_ok=True)
+                coord_system.save(coord_system_path)
+    
+    combined = ConcatDataset(all_datasets)
+    
+    # Attach coordinate system and environment mapping to the combined dataset
+    combined.coordinate_system = coord_system
+    combined.env_to_datasets = env_to_datasets
+    combined.all_datasets = all_datasets
+    
+    print("=" * 60)
+    print(f"TOTAL: {total_frames:,} frames from {len(all_datasets)} sequences")
+    if coord_system:
+        print(f"Coordinate system: {len(coord_system.environments)} environments")
+    print("=" * 60)
+    
+    return combined
+
+
 class CSEDataset(Dataset):
     """
     Enhanced CSE Dataset loader for single camera sequences.

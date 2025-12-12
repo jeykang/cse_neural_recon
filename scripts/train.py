@@ -22,7 +22,7 @@ import torch.nn as nn
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data import CSEDataset, create_multi_sequence_dataset
+from src.data import CSEDataset, create_multi_sequence_dataset, create_multi_environment_dataset
 from src.models import NeuralSDF, NeuralSDFWithPlanar, HashGridSDF
 from src.losses import SDFLoss, PlanarConsistencyLoss, ManhattanLoss
 from src.training import Trainer, TrainingConfig
@@ -164,7 +164,10 @@ def create_model(config: dict, device: str = 'cuda') -> nn.Module:
 def create_dataset(config: dict):
     """Create dataset from config.
     
-    Supports single sequence or multi-sequence training.
+    Supports:
+    - Single sequence training
+    - Multi-sequence training (same environment, multiple trajectories)
+    - Multi-environment training (different environments with all sequences)
     """
     data_config = config.get('data', {})
     
@@ -191,13 +194,22 @@ def create_dataset(config: dict):
         cache_frames=data_config.get('cache_frames', False),
     )
     
-    # Check for multi-sequence training
-    multi_sequence = data_config.get('multi_sequence', False)
-    sequences = data_config.get('sequences', None)
-    sequence_pattern = data_config.get('sequence_pattern', 'static_*')
+    # Check for multi-environment training (highest priority)
+    multi_environment = data_config.get('multi_environment', False)
+    environments = data_config.get('environments', None)
     
-    if multi_sequence:
-        # Multi-sequence mode: combine multiple trajectories
+    if multi_environment and environments:
+        # Multi-environment mode: combine data from different scenes
+        print("Loading MULTI-ENVIRONMENT dataset")
+        dataset = create_multi_environment_dataset(
+            environments=environments,
+            **dataset_kwargs
+        )
+    elif data_config.get('multi_sequence', False):
+        # Multi-sequence mode: combine multiple trajectories from same environment
+        sequences = data_config.get('sequences', None)
+        sequence_pattern = data_config.get('sequence_pattern', 'static_*')
+        
         base_dir = data_config.get('base_dir', data_path)
         if not os.path.isdir(base_dir):
             # data_path might be a specific sequence - use its parent
