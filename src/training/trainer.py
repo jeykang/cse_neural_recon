@@ -44,6 +44,8 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     weight_decay: float = 1e-5
     betas: tuple = (0.9, 0.999)
+    encoding_lr_mult: float = 10.0
+    encoding_weight_decay: float = 0.0
     
     # Scheduler
     scheduler: str = "cosine"
@@ -56,15 +58,23 @@ class TrainingConfig:
     num_random_samples: int = 4096  # Random points in empty space
     freespace_jitter_min: float = 0.1
     freespace_jitter_max: float = 2.0  # Increased range for large scenes
+    tsdf_num_depth_samples: int = 8
+    tsdf_num_rays: Optional[int] = None  # Defaults to num_surface_samples // 4
     
     # Loss weights
     surface_weight: float = 1.0
     freespace_weight: float = 2.0  # Increased to better learn empty space
     eikonal_weight: float = 0.05  # Reduced - was dominating
     random_space_weight: float = 1.0  # For random space sampling
+    tsdf_weight: float = 1.0
+    tsdf_behind_weight: float = 0.1  # Lower weight for points behind observed depth
     planar_weight: float = 0.3
     normal_weight: float = 0.2
     manhattan_weight: float = 0.1
+    
+    # TSDF supervision
+    use_tsdf_supervision: bool = True
+    truncation_dist: float = 0.2  # meters
     
     # Training options
     use_amp: bool = True
@@ -194,8 +204,18 @@ class Trainer:
             self._compute_scene_bounds_from_depth()
         
         scene_extent = self.scene_max - self.scene_min
+        # Use an isotropic cube for normalization so that distances in normalized
+        # space correspond to a single global scale. This keeps TSDF/freespace
+        # targets and the eikonal term consistent (per-axis min/max scaling
+        # warps space and can lead to degenerate near-constant SDF solutions).
+        self.scene_scale = float(scene_extent.max().item())
+        self.scene_center = (self.scene_min + self.scene_max) * 0.5
+        self.cube_min = self.scene_center - (self.scene_scale * 0.5)
+        self.cube_max = self.scene_center + (self.scene_scale * 0.5)
+
         print(f"Scene bounds: min={self.scene_min.cpu().numpy()}, max={self.scene_max.cpu().numpy()}")
         print(f"Scene extent: {scene_extent.cpu().numpy()}")
+        print(f"Normalization cube: min={self.cube_min.cpu().numpy()}, max={self.cube_max.cpu().numpy()}, scale={self.scene_scale:.3f}m")
     
     def _compute_scene_bounds_from_depth(self):
         """
@@ -281,15 +301,15 @@ class Trainer:
     def _normalize_coords(self, coords: torch.Tensor) -> torch.Tensor:
         """
         Normalize world coordinates to [0, 1] range for the hash grid.
-        
+
         Args:
             coords: (*, 3) world coordinates
             
         Returns:
             (*, 3) normalized coordinates in [0, 1]
         """
-        # Map from [scene_min, scene_max] to [0, 1]
-        normalized = (coords - self.scene_min) / (self.scene_max - self.scene_min + 1e-8)
+        # Map from an isotropic cube [cube_min, cube_max] to [0, 1]
+        normalized = (coords - self.cube_min) / (self.scene_scale + 1e-8)
         # Clamp to handle points slightly outside bounds
         normalized = torch.clamp(normalized, 0.0, 1.0)
         return normalized
@@ -304,7 +324,7 @@ class Trainer:
         Returns:
             (*, 3) world coordinates
         """
-        return normalized * (self.scene_max - self.scene_min) + self.scene_min
+        return normalized * self.scene_scale + self.cube_min
         
     def _init_visualizer(self):
         """Initialize the training visualizer."""
@@ -316,8 +336,8 @@ class Trainer:
                 device=self.device,
             )
             # Pass scene bounds to visualizer if available
-            if hasattr(self, 'scene_min') and hasattr(self, 'scene_max'):
-                self.visualizer.set_scene_bounds(self.scene_min, self.scene_max)
+            if hasattr(self, 'cube_min') and hasattr(self, 'cube_max'):
+                self.visualizer.set_scene_bounds(self.cube_min, self.cube_max)
             print("Visualization enabled - will generate point cloud comparisons")
         except Exception as e:
             print(f"Warning: Could not initialize visualizer: {e}")
@@ -325,23 +345,46 @@ class Trainer:
         
     def _create_optimizer(self) -> torch.optim.Optimizer:
         """Create optimizer based on config."""
+        # Use a higher LR for hash-grid parameters by default. With a single LR
+        # across all params, the hash tables often barely move and the network
+        # collapses/plateaus early.
+        param_groups = None
+        encoding = getattr(self.model, 'encoding', None)
+        if encoding is not None:
+            encoding_params = [p for p in encoding.parameters() if p.requires_grad]
+            if encoding_params and float(getattr(self.config, 'encoding_lr_mult', 1.0)) != 1.0:
+                encoding_ids = {id(p) for p in encoding_params}
+                other_params = [p for p in self.model.parameters() if p.requires_grad and id(p) not in encoding_ids]
+                param_groups = [
+                    {
+                        'params': other_params,
+                        'lr': self.config.learning_rate,
+                        'weight_decay': self.config.weight_decay,
+                    },
+                    {
+                        'params': encoding_params,
+                        'lr': self.config.learning_rate * float(getattr(self.config, 'encoding_lr_mult', 10.0)),
+                        'weight_decay': float(getattr(self.config, 'encoding_weight_decay', 0.0)),
+                    },
+                ]
+
         if self.config.optimizer == "adam":
             return torch.optim.Adam(
-                self.model.parameters(),
+                param_groups if param_groups is not None else self.model.parameters(),
                 lr=self.config.learning_rate,
                 betas=self.config.betas,
                 weight_decay=self.config.weight_decay
             )
         elif self.config.optimizer == "adamw":
             return torch.optim.AdamW(
-                self.model.parameters(),
+                param_groups if param_groups is not None else self.model.parameters(),
                 lr=self.config.learning_rate,
                 betas=self.config.betas,
                 weight_decay=self.config.weight_decay
             )
         elif self.config.optimizer == "sgd":
             return torch.optim.SGD(
-                self.model.parameters(),
+                param_groups if param_groups is not None else self.model.parameters(),
                 lr=self.config.learning_rate,
                 momentum=0.9,
                 weight_decay=self.config.weight_decay
@@ -564,64 +607,119 @@ class Trainer:
         
         B, H, W = depth.shape
         
-        # Scene scale for normalizing SDF targets
-        scene_extent = self.scene_max - self.scene_min
-        scene_scale = scene_extent.mean().item()
+        # Scene scale for normalizing SDF targets (world meters per normalized unit).
+        # This matches the isotropic normalization cube used by `_normalize_coords`.
+        scene_scale = float(getattr(self, 'scene_scale', (self.scene_max - self.scene_min).max().item()))
         
-        # Truncation distance in NORMALIZED coordinates
-        # Use 1% of scene size for truncation band
-        truncation_normalized = 0.02  # 2% of normalized [0,1] space
-        truncation_world = truncation_normalized * scene_scale
+        truncation_world = float(getattr(self.config, 'truncation_dist', 0.2))
+        truncation_world = max(truncation_world, 1e-6)
+        truncation_normalized = truncation_world / (scene_scale + 1e-8)
         
-        # Sample TSDF points along rays (key to learning proper SDF)
-        tsdf_points_world, tsdf_targets_world = self._sample_tsdf_points(
-            depth, pose, K, valid_mask, truncation_world
-        )
+        # Sample TSDF points along rays (optional; config controls)
+        if getattr(self.config, 'use_tsdf_supervision', True):
+            tsdf_points_world, tsdf_targets_world = self._sample_tsdf_points(
+                depth, pose, K, valid_mask, truncation_world
+            )
+        else:
+            tsdf_points_world = torch.zeros((B, 0, 3), device=self.device, dtype=torch.float32)
+            tsdf_targets_world = torch.zeros((B, 0), device=self.device, dtype=torch.float32)
         
         # Sample surface points (SDF = 0)
         surface_points_world, camera_centers = self._sample_surface_points(
             depth, pose, K, valid_mask
         )
         
-        # Sample random far-field points (positive SDF, far from surface)
-        far_points_world = self._sample_random_space_points(B)
+        # Sample freespace points between camera and observed surface (positive SDF)
+        freespace_points_world, freespace_targets_world = self._sample_freespace_points(
+            surface_points_world, camera_centers
+        )
+        
+        # Sample random points in the scene volume (weak outside prior)
+        random_points_world = self._sample_random_space_points(B)
+        
+        # Track how much sampling falls outside the normalization cube (will be clamped).
+        # High clamp rates are a strong signal that bounds are wrong and the model
+        # is forced into many-to-one coordinate mappings (often causing collapse).
+        cube_min = getattr(self, 'cube_min', self.scene_min)
+        cube_max = getattr(self, 'cube_max', self.scene_max)
+        with torch.no_grad():
+            clamp_surface = ((surface_points_world < cube_min) | (surface_points_world > cube_max)).any(dim=-1).float().mean().item()
+            clamp_freespace = ((freespace_points_world < cube_min) | (freespace_points_world > cube_max)).any(dim=-1).float().mean().item()
+            clamp_random = ((random_points_world < cube_min) | (random_points_world > cube_max)).any(dim=-1).float().mean().item()
+            if tsdf_points_world.numel():
+                clamp_tsdf = ((tsdf_points_world < cube_min) | (tsdf_points_world > cube_max)).any(dim=-1).float().mean().item()
+            else:
+                clamp_tsdf = 0.0
         
         # Normalize all coordinates to [0, 1]
-        tsdf_points = self._normalize_coords(tsdf_points_world)
+        tsdf_points = self._normalize_coords(tsdf_points_world) if tsdf_points_world.numel() else tsdf_points_world
         surface_points = self._normalize_coords(surface_points_world)
-        far_points = self._normalize_coords(far_points_world)
+        freespace_points = self._normalize_coords(freespace_points_world)
+        random_points = self._normalize_coords(random_points_world)
         
         # Normalize SDF targets to same scale as coordinates
-        # This ensures TSDF targets are in [-truncation_normalized, +truncation_normalized]
-        tsdf_targets = tsdf_targets_world / scene_scale
+        tsdf_targets = tsdf_targets_world / (scene_scale + 1e-8)
+        freespace_targets = freespace_targets_world / (scene_scale + 1e-8)
         
         # Forward pass with mixed precision
         with autocast(enabled=self.config.use_amp):
-            # TSDF points (most important for geometry)
-            tsdf_out = self.model(tsdf_points)
-            sdf_tsdf = tsdf_out['sdf'].squeeze(-1)  # (B, N)
+            # TSDF points (optional)
+            if tsdf_points.shape[1] > 0:
+                tsdf_out = self.model(tsdf_points)
+                sdf_tsdf = tsdf_out['sdf'].squeeze(-1)  # (B, N)
+            else:
+                sdf_tsdf = None
             
             # Surface points
             surface_out = self.model(surface_points)
             sdf_surface = surface_out['sdf']
             
-            # Far-field points (should have large positive SDF)
-            far_out = self.model(far_points)
-            sdf_far = far_out['sdf']
+            # Freespace points (in front of observed depth)
+            freespace_out = self.model(freespace_points)
+            sdf_freespace = freespace_out['sdf'].squeeze(-1)
+            
+            # Random points (weak outside prior)
+            random_out = self.model(random_points)
+            sdf_random = random_out['sdf'].squeeze(-1)
             
             # === TSDF Loss (most important) ===
-            # L1 loss on truncated SDF values
-            loss_tsdf = torch.abs(sdf_tsdf - tsdf_targets).mean()
+            # Use asymmetric weighting: points behind observed depth are less reliable.
+            if sdf_tsdf is not None:
+                tsdf_err = torch.abs(sdf_tsdf - tsdf_targets)
+                front_mask = tsdf_targets >= 0
+                behind_mask = ~front_mask
+                
+                loss_tsdf_front = tsdf_err[front_mask].mean() if front_mask.any() else torch.tensor(0.0, device=self.device)
+                loss_tsdf_behind = tsdf_err[behind_mask].mean() if behind_mask.any() else torch.tensor(0.0, device=self.device)
+                loss_tsdf = loss_tsdf_front + float(getattr(self.config, 'tsdf_behind_weight', 0.1)) * loss_tsdf_behind
+            else:
+                loss_tsdf = torch.tensor(0.0, device=self.device)
             
             # === Surface Loss ===
             # Surface points should have SDF = 0
             loss_surface = torch.abs(sdf_surface).mean()
             
-            # === Far-field Loss ===
-            # Far points should have positive SDF (outside surface)
-            # Use same scale as TSDF - want far field to be beyond truncation
-            min_far_sdf = truncation_normalized * 2  # Twice the truncation distance
-            loss_far = torch.relu(min_far_sdf - sdf_far).mean()
+            # === Freespace Loss ===
+            # Along the ray between camera and observed surface, SDF must be positive.
+            # Use a hinge (lower bound) to reduce conflicts in cluttered scenes.
+            loss_freespace = torch.relu(freespace_targets - sdf_freespace).mean()
+            
+            # === Random-space Loss ===
+            # Encourage "mostly outside" without forcing large distances everywhere.
+            min_random_sdf = 0.0
+            loss_random = torch.relu(min_random_sdf - sdf_random).mean()
+
+        # Lightweight diagnostics to catch early collapse (e.g., near-constant SDF).
+        with torch.no_grad():
+            sdf_surface_flat = sdf_surface.squeeze(-1).float()
+            sdf_freespace_flat = sdf_freespace.float()
+            sdf_random_flat = sdf_random.float()
+            if sdf_tsdf is not None:
+                sdf_tsdf_flat = sdf_tsdf.float()
+                tsdf_target_flat = tsdf_targets.float()
+            else:
+                sdf_tsdf_flat = None
+                tsdf_target_flat = None
         
         # === Eikonal Loss (outside AMP for stability) ===
         if self.config.eikonal_weight > 0:
@@ -646,12 +744,12 @@ class Trainer:
         else:
             loss_eikonal = torch.tensor(0.0, device=self.device)
         
-        # Total loss with proper weighting
-        # TSDF is the primary supervision, surface is regularization
+        # Total loss with config-driven weighting
         loss = (
-            2.0 * loss_tsdf +  # Primary TSDF supervision
+            float(getattr(self.config, 'tsdf_weight', 1.0)) * loss_tsdf +
             self.config.surface_weight * loss_surface +
-            0.5 * loss_far +  # Encourage positive SDF in empty space
+            self.config.freespace_weight * loss_freespace +
+            self.config.random_space_weight * loss_random +
             self.config.eikonal_weight * loss_eikonal
         )
             
@@ -680,9 +778,30 @@ class Trainer:
         components = {
             'tsdf': loss_tsdf.item(),
             'surface': loss_surface.item(),
-            'far': loss_far.item(),
+            'freespace': loss_freespace.item(),
+            'random': loss_random.item(),
             'eikonal': loss_eikonal.item(),
+            'sdf_surface_mean': sdf_surface_flat.mean().item(),
+            'sdf_surface_std': sdf_surface_flat.std().item(),
+            'sdf_freespace_mean': sdf_freespace_flat.mean().item(),
+            'sdf_freespace_std': sdf_freespace_flat.std().item(),
+            'sdf_random_mean': sdf_random_flat.mean().item(),
+            'sdf_random_std': sdf_random_flat.std().item(),
+            'clamp_tsdf': clamp_tsdf,
+            'clamp_surface': clamp_surface,
+            'clamp_freespace': clamp_freespace,
+            'clamp_random': clamp_random,
         }
+
+        if sdf_tsdf_flat is not None and tsdf_target_flat is not None:
+            components.update(
+                {
+                    'sdf_tsdf_mean': sdf_tsdf_flat.mean().item(),
+                    'sdf_tsdf_std': sdf_tsdf_flat.std().item(),
+                    'tsdf_target_mean': tsdf_target_flat.mean().item(),
+                    'tsdf_target_std': tsdf_target_flat.std().item(),
+                }
+            )
         
         return loss, components
     
@@ -717,9 +836,9 @@ class Trainer:
         device = depth.device
         
         # Number of rays to sample per image
-        num_rays = self.config.num_surface_samples // 4
+        num_rays = int(self.config.tsdf_num_rays or (self.config.num_surface_samples // 4))
         # Number of depth samples per ray
-        num_depth_samples = 8
+        num_depth_samples = int(self.config.tsdf_num_depth_samples)
         
         all_points = []
         all_targets = []
@@ -727,6 +846,12 @@ class Trainer:
         for b in range(B):
             # Get valid pixels
             valid_idx = torch.where(valid_mask[b].flatten())[0]
+            if len(valid_idx) == 0:
+                points = torch.zeros((num_rays * num_depth_samples, 3), device=device, dtype=torch.float32)
+                sdf_targets = torch.zeros((num_rays * num_depth_samples,), device=device, dtype=torch.float32)
+                all_points.append(points)
+                all_targets.append(sdf_targets)
+                continue
             
             if len(valid_idx) < num_rays:
                 # Not enough valid pixels, sample with replacement
@@ -780,7 +905,8 @@ class Trainer:
             # Compute SDF targets: signed distance to surface along ray
             # Negative = inside (behind surface), Positive = outside (in front of surface)
             # Note: SDF convention - positive outside, negative inside
-            sdf_targets = -depth_offsets.unsqueeze(0).expand(num_rays, -1)  # (num_rays, num_depth_samples)
+            # Use actual sampled depths (accounts for clamping) rather than raw offsets.
+            sdf_targets = (ray_depths.unsqueeze(1) - sample_depths)  # (num_rays, num_depth_samples)
             
             # Truncate
             sdf_targets = torch.clamp(sdf_targets, -truncation, truncation)
@@ -797,8 +923,6 @@ class Trainer:
         all_targets = torch.stack([t for t in all_targets], dim=0)  # (B, N)
         
         return all_points, all_targets
-        
-        return loss, components
         
     def _sample_surface_points(
         self,
@@ -873,6 +997,19 @@ class Trainer:
         camera_centers: torch.Tensor
     ) -> tuple:
         """Sample freespace points between camera and surface."""
+        # Subsample/resize to configured freespace sample count (per item)
+        target_n = int(self.config.num_freespace_samples)
+        if surface_points.shape[1] != target_n:
+            if surface_points.shape[1] > target_n:
+                idx = torch.randperm(surface_points.shape[1], device=surface_points.device)[:target_n]
+                surface_points = surface_points[:, idx]
+                camera_centers = camera_centers[:, idx]
+            else:
+                pad = target_n - surface_points.shape[1]
+                idx = torch.randint(surface_points.shape[1], (pad,), device=surface_points.device)
+                surface_points = torch.cat([surface_points, surface_points[:, idx]], dim=1)
+                camera_centers = torch.cat([camera_centers, camera_centers[:, idx]], dim=1)
+
         # Ray direction (from surface to camera)
         ray_dirs = camera_centers - surface_points
         ray_lengths = torch.norm(ray_dirs, dim=-1, keepdim=True)
@@ -909,16 +1046,18 @@ class Trainer:
         """
         N = self.config.num_random_samples
         
-        # Sample uniformly in the scene bounding box (world coordinates)
+        # Sample uniformly in the normalization cube (world coordinates).
+        # This aligns random-space supervision with the model's normalized domain.
         random_points = torch.rand(
             batch_size, N, 3, 
             device=self.device, 
             dtype=torch.float32
         )
         
-        # Scale to scene bounds
-        scene_extent = self.scene_max - self.scene_min
-        random_points = random_points * scene_extent + self.scene_min
+        cube_min = getattr(self, 'cube_min', self.scene_min)
+        cube_max = getattr(self, 'cube_max', self.scene_max)
+        cube_extent = cube_max - cube_min
+        random_points = random_points * cube_extent + cube_min
         
         return random_points
         

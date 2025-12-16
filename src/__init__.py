@@ -16,113 +16,133 @@ Modules:
 
 __version__ = '0.1.0'
 
-# Data
-from .data import (
-    CSEDataset,
-    CSEMultiCameraDataset,
-    MultiCameraSynchronizer,
-    CameraRig,
-    DataAugmentation,
-    DepthProcessor
-)
+# Avoid importing heavy optional deps (e.g., Open3D) at package import time.
+# Training scripts typically import from `src.data` / `src.models` directly.
 
-# Models
-from .models import (
-    NeuralSDF,
-    NeuralSDFWithPlanar,
-    HashGridEncoding,
-    PositionalEncoding,
-    PlanarAttention,
-    IterativePointFilter,
-    ScoreNetwork,
-)
+_exported = {'__version__'}
 
-# Losses
-from .losses import (
-    SDFLoss,
-    SurfaceLoss,
-    FreespaceLoss,
-    EikonalLoss,
-    PlanarConsistencyLoss,
-    ManhattanLoss,
-    SmoothnessLoss,
-)
+try:
+    from .models import (  # noqa: F401
+        NeuralSDF,
+        NeuralSDFWithPlanar,
+        HashGridEncoding,
+        PositionalEncoding,
+        PlanarAttention,
+        IterativePointFilter,
+        ScoreNetwork,
+    )
+    _exported.update({
+        'NeuralSDF',
+        'NeuralSDFWithPlanar',
+        'HashGridEncoding',
+        'PositionalEncoding',
+        'PlanarAttention',
+        'IterativePointFilter',
+        'ScoreNetwork',
+    })
+except Exception:
+    pass
 
-# Training
-from .training import (
-    Trainer,
-    TrainingConfig,
-    CheckpointManager,
-    get_scheduler,
-    get_sampler
-)
+try:
+    from .losses import (  # noqa: F401
+        SDFLoss,
+        SurfaceLoss,
+        FreespaceLoss,
+        EikonalLoss,
+        PlanarConsistencyLoss,
+        ManhattanLoss,
+        SmoothnessLoss,
+    )
+    _exported.update({
+        'SDFLoss',
+        'SurfaceLoss',
+        'FreespaceLoss',
+        'EikonalLoss',
+        'PlanarConsistencyLoss',
+        'ManhattanLoss',
+        'SmoothnessLoss',
+    })
+except Exception:
+    pass
 
-# Refinement
-from .refinement import (
-    extract_mesh_from_sdf,
-    StatisticalOutlierRemoval,
-    RadiusOutlierRemoval,
-    voxel_downsample,
-    NeuralRefiner,
-    PointCompletionNetwork
-)
+try:
+    from .training import (  # noqa: F401
+        Trainer,
+        TrainingConfig,
+        CheckpointManager,
+        get_scheduler,
+        get_sampler,
+    )
+    _exported.update({
+        'Trainer',
+        'TrainingConfig',
+        'CheckpointManager',
+        'get_scheduler',
+        'get_sampler',
+    })
+except Exception:
+    pass
 
-# Utils
-from .utils import (
-    visualize_point_cloud,
-    visualize_mesh,
-    visualize_depth,
-    load_point_cloud,
-    save_point_cloud,
-    chamfer_distance,
-    f_score
-)
+try:
+    from .utils import (  # noqa: F401
+        visualize_point_cloud,
+        visualize_mesh,
+        visualize_depth,
+        load_point_cloud,
+        save_point_cloud,
+        chamfer_distance,
+        f_score,
+    )
+    _exported.update({
+        'visualize_point_cloud',
+        'visualize_mesh',
+        'visualize_depth',
+        'load_point_cloud',
+        'save_point_cloud',
+        'chamfer_distance',
+        'f_score',
+    })
+except Exception:
+    pass
 
-__all__ = [
-    # Version
-    '__version__',
-    # Data
-    'CSEDataset',
-    'CSEMultiCameraDataset', 
-    'MultiCameraSynchronizer',
-    'CameraRig',
-    'DataAugmentation',
-    'DepthProcessor',
-    # Models
-    'NeuralSDF',
-    'NeuralSDFWithPlanar',
-    'HashGridEncoding',
-    'PositionalEncoding',
-    'PlanarAttention',
-    'IterativePointFilter',
-    'ScoreNetwork',
-    # Losses
-    'SDFLoss',
-    'SurfaceLoss',
-    'FreespaceLoss',
-    'EikonalLoss',
-    'PlanarConsistencyLoss',
-    'ManhattanLoss',
-    'SmoothnessLoss',
-    # Training
-    'Trainer',
-    'TrainingConfig',
-    'CheckpointManager',
-    'get_scheduler',
-    'get_sampler',
-    # Refinement
-    'extract_mesh_from_sdf',
-    'StatisticalOutlierRemoval',
-    'RadiusOutlierRemoval',
-    'voxel_downsample',
-    'NeuralRefiner',
-    'PointCompletionNetwork',
-    # Utils
-    'visualize_point_cloud',
-    'visualize_mesh',
-    'visualize_depth',
-    'load_point_cloud',
-    'save_point_cloud',
-    'chamfer_distance',
-    'f_score'
-]
+try:
+    from .data import (  # noqa: F401
+        CSEDataset,
+        CSEMultiCameraDataset,
+        MultiCameraSynchronizer,
+        CameraRig,
+        DataAugmentation,
+        DepthProcessor,
+    )
+    _exported.update({
+        'CSEDataset',
+        'CSEMultiCameraDataset',
+        'MultiCameraSynchronizer',
+        'CameraRig',
+        'DataAugmentation',
+        'DepthProcessor',
+    })
+except Exception:
+    pass
+
+try:
+    from .refinement import (  # noqa: F401
+        extract_mesh_from_sdf,
+        StatisticalOutlierRemoval,
+        RadiusOutlierRemoval,
+        voxel_downsample,
+        NeuralRefiner,
+        PointCompletionNetwork,
+    )
+    _exported.update({
+        'extract_mesh_from_sdf',
+        'StatisticalOutlierRemoval',
+        'RadiusOutlierRemoval',
+        'voxel_downsample',
+        'NeuralRefiner',
+        'PointCompletionNetwork',
+    })
+except Exception:
+    pass
+
+__all__ = sorted(_exported)

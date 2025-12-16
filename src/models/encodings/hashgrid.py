@@ -117,8 +117,13 @@ class HashGridEncoding(nn.Module):
         N = x.shape[0]
         device = x.device
         
-        # Scale coordinates to grid
-        x_scaled = x * resolution
+        # Scale coordinates to grid vertices.
+        # We treat `resolution` as the number of grid vertices per axis, so valid
+        # integer indices are in [0, resolution - 1]. Mapping [0, 1] -> [0, resolution - 1]
+        # avoids producing an out-of-range `ceil` index (which previously caused
+        # excessive hash collisions near the boundary and can lead to early
+        # representation collapse).
+        x_scaled = x * (resolution - 1)
         
         # Get corner indices
         x_floor = torch.floor(x_scaled).long()
@@ -126,7 +131,7 @@ class HashGridEncoding(nn.Module):
         
         # Clamp to valid range
         x_floor = torch.clamp(x_floor, 0, resolution - 1)
-        x_ceil = torch.clamp(x_ceil, 0, resolution)
+        x_ceil = torch.clamp(x_ceil, 0, resolution - 1)
         
         # Interpolation weights
         w = x_scaled - x_floor.float()  # (N, 3)
@@ -233,13 +238,14 @@ class HashGridEncoding(nn.Module):
         Returns:
             hash_indices: (N, num_corners) indices into hash table
         """
-        # XOR-based spatial hashing
+        # XOR-based spatial hashing (Instant-NGP style).
         primes = self.primes[:self.input_dim]
         
         # indices: (N, num_corners, dim)
         # primes: (dim,)
-        hashed = indices * primes
-        hashed = hashed.sum(dim=-1)  # XOR approximation via sum
+        hashed = torch.zeros(indices.shape[:-1], device=indices.device, dtype=torch.long)
+        for d in range(self.input_dim):
+            hashed ^= (indices[..., d].long() * primes[d].long())
         
         # Modulo hash table size
         hash_indices = hashed % self.hashmap_size

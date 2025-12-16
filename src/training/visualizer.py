@@ -169,7 +169,7 @@ class TrainingVisualizer:
         return eval_metrics
     
     def _extract_point_cloud(self, threshold: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
-        """Extract point cloud from neural SDF using marching cubes-style sampling.
+        """Extract point cloud from neural SDF using marching cubes.
         
         The model operates in normalized [0, 1] coordinates, but we return 
         points in world coordinates for visualization and comparison.
@@ -202,31 +202,50 @@ class TrainingVisualizer:
                 
                 sdf_grid[i] = sdf.reshape(self.grid_resolution, self.grid_resolution)
         
-        # Extract surface points (where SDF is close to zero)
-        # Use smaller threshold to avoid extracting too many points
-        surface_mask = np.abs(sdf_grid) < 0.005  # Tighter threshold in normalized space
-        
-        # Get coordinates of surface points (in normalized space)
+        # Prefer marching cubes for a surface-aligned extraction (more stable than
+        # thresholding |SDF| on a grid, especially when SDF magnitudes are small).
+        try:
+            from skimage.measure import marching_cubes
+        except Exception:
+            marching_cubes = None
+
+        if marching_cubes is not None:
+            try:
+                verts, _faces, _normals, values = marching_cubes(sdf_grid, level=0.0)
+                # verts are in voxel coordinates [0, res-1] in (x, y, z) order.
+                denom = max(self.grid_resolution - 1, 1)
+                points_normalized = np.stack(
+                    [
+                        min_bound[0] + (verts[:, 0] / denom) * (max_bound[0] - min_bound[0]),
+                        min_bound[1] + (verts[:, 1] / denom) * (max_bound[1] - min_bound[1]),
+                        min_bound[2] + (verts[:, 2] / denom) * (max_bound[2] - min_bound[2]),
+                    ],
+                    axis=-1,
+                )
+                points = self._denormalize_points(points_normalized)
+                return points, values
+            except Exception as e:
+                print(f"  [Viz] Marching cubes failed ({e}); falling back to thresholding.")
+
+        # Fallback: extract points where |SDF| is small.
+        surface_mask = np.abs(sdf_grid) < 0.005
         indices = np.where(surface_mask)
         if len(indices[0]) == 0:
-            # Fallback: use slightly larger threshold
             surface_mask = np.abs(sdf_grid) < 0.01
             indices = np.where(surface_mask)
             if len(indices[0]) == 0:
                 return np.zeros((0, 3)), np.zeros((0,))
-        
-        # Convert indices to normalized [0, 1] coordinates
-        points_normalized = np.stack([
-            min_bound[0] + indices[0] * (max_bound[0] - min_bound[0]) / self.grid_resolution,
-            min_bound[1] + indices[1] * (max_bound[1] - min_bound[1]) / self.grid_resolution,
-            min_bound[2] + indices[2] * (max_bound[2] - min_bound[2]) / self.grid_resolution,
-        ], axis=-1)
-        
-        # Convert to world coordinates for visualization/comparison
+
+        points_normalized = np.stack(
+            [
+                min_bound[0] + indices[0] * (max_bound[0] - min_bound[0]) / self.grid_resolution,
+                min_bound[1] + indices[1] * (max_bound[1] - min_bound[1]) / self.grid_resolution,
+                min_bound[2] + indices[2] * (max_bound[2] - min_bound[2]) / self.grid_resolution,
+            ],
+            axis=-1,
+        )
         points = self._denormalize_points(points_normalized)
-        
         sdf_values = sdf_grid[indices]
-        
         return points, sdf_values
     
     def _compute_metrics(
