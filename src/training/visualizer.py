@@ -106,6 +106,7 @@ class TrainingVisualizer:
         val_metrics: Optional[Dict[str, float]] = None,
         sample_batch: Optional[Dict[str, torch.Tensor]] = None,
         gt_points: Optional[np.ndarray] = None,
+        gt_groups: Optional[Dict[str, np.ndarray]] = None,
     ) -> Dict[str, float]:
         """
         Generate full visualization suite for a checkpoint.
@@ -130,17 +131,64 @@ class TrainingVisualizer:
         
         # 1. Generate reconstructed point cloud
         print(f"  Generating reconstruction for epoch {epoch}...")
-        pred_points, pred_sdf = self._extract_point_cloud()
+        pred_points, pred_sdf = self._extract_point_cloud(sample_batch=sample_batch)
         
+        # If conditional model and we have view poses, crop GT to local region.
+        gt_points_local = gt_points
+        crop_mn = None
+        crop_mx = None
+        if sample_batch is not None and gt_points is not None and len(gt_points) > 0:
+            if 'views_pose' in sample_batch:
+                cam_centers = sample_batch['views_pose'][0, :, :3, 3].detach().cpu().numpy()
+                cmin = cam_centers.min(axis=0)
+                cmax = cam_centers.max(axis=0)
+                # Margin in meters; wide enough to include local context.
+                margin = 10.0
+                mn = cmin - margin
+                mx = cmax + margin
+                crop_mn, crop_mx = mn, mx
+                mask = np.all((gt_points >= mn) & (gt_points <= mx), axis=1)
+                if mask.any():
+                    gt_points_local = gt_points[mask]
+
         # 2. Compare with ground truth if available and non-empty
-        if gt_points is not None and len(gt_points) > 0 and len(pred_points) > 0:
-            eval_metrics = self._compute_metrics(pred_points, gt_points)
+        if gt_points_local is not None and len(gt_points_local) > 0 and len(pred_points) > 0:
+            eval_metrics = self._compute_metrics(pred_points, gt_points_local)
             self._update_eval_history(eval_metrics)
             
             # Side-by-side comparison
             self._visualize_comparison(
-                pred_points, gt_points, epoch, epoch_dir
+                pred_points, gt_points_local, epoch, epoch_dir
             )
+        # Optional: also generate per-group comparisons (e.g., per sequence).
+        if gt_groups is not None and len(pred_points) > 0:
+            groups_dir = epoch_dir / 'gt_groups'
+            groups_dir.mkdir(parents=True, exist_ok=True)
+            group_rows: List[str] = []
+            for name, pts in sorted(gt_groups.items(), key=lambda kv: kv[0]):
+                if pts is None or len(pts) == 0:
+                    continue
+                if crop_mn is not None and crop_mx is not None:
+                    m = np.all((pts >= crop_mn) & (pts <= crop_mx), axis=1)
+                    pts = pts[m] if m.any() else pts
+                safe = "".join(c if c.isalnum() or c in "-_." else "_" for c in str(name))
+                out_dir = groups_dir / safe
+                out_dir.mkdir(parents=True, exist_ok=True)
+                m = self._compute_metrics(pred_points, pts)
+                group_rows.append(
+                    f"{name}\tchamfer={m.get('chamfer_distance', 0):.6f}\t"
+                    f"acc5cm={m.get('accuracy_5cm', 0)*100:.3f}%\t"
+                    f"fscore5cm={m.get('fscore_5cm', 0)*100:.3f}%\t"
+                    f"pred/gt={m.get('point_ratio', 0):.3f}"
+                )
+                self._visualize_comparison(pred_points, pts, epoch, out_dir)
+
+            if group_rows:
+                with open(groups_dir / 'metrics_by_group.txt', 'w') as f:
+                    f.write("Per-group GT comparisons (same prediction vs different GT subsets)\n")
+                    f.write("name\tchamfer\tacc5cm\tfscore5cm\tpred/gt\n")
+                    for row in group_rows:
+                        f.write(row + "\n")
         elif len(pred_points) > 0:
             # Just visualize prediction (no GT available)
             print(f"  No ground truth available - visualizing prediction only")
@@ -151,7 +199,7 @@ class TrainingVisualizer:
             )
         
         # 3. Visualize SDF slices
-        self._visualize_sdf_slices(epoch, epoch_dir)
+        self._visualize_sdf_slices(epoch, epoch_dir, sample_batch=sample_batch)
         
         # 4. Visualize depth comparison if batch provided
         if sample_batch is not None:
@@ -168,7 +216,11 @@ class TrainingVisualizer:
         
         return eval_metrics
     
-    def _extract_point_cloud(self, threshold: float = 0.0) -> Tuple[np.ndarray, np.ndarray]:
+    def _extract_point_cloud(
+        self,
+        threshold: float = 0.0,
+        sample_batch: Optional[Dict[str, torch.Tensor]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """Extract point cloud from neural SDF using marching cubes.
         
         The model operates in normalized [0, 1] coordinates, but we return 
@@ -176,8 +228,19 @@ class TrainingVisualizer:
         """
         self.model.eval()
         
-        # Create 3D grid in normalized [0, 1] space (model's input space)
-        min_bound, max_bound = self.bounds  # [0, 0, 0] to [1, 1, 1]
+        # Create 3D grid in normalized [0, 1] space (model's input space).
+        # For conditional models, focus on a local region around the provided views.
+        min_bound, max_bound = self.bounds  # default: [0,0,0] to [1,1,1]
+        if sample_batch is not None and 'views_pose' in sample_batch and self.scene_bounds is not None:
+            # Compute local bounds in world space around camera centers and map to normalized.
+            cam_centers = sample_batch['views_pose'][0, :, :3, 3].detach().cpu().numpy()
+            margin = 10.0
+            mn_w = cam_centers.min(axis=0) - margin
+            mx_w = cam_centers.max(axis=0) + margin
+            mn_n = self._normalize_points(mn_w[None, :])[0]
+            mx_n = self._normalize_points(mx_w[None, :])[0]
+            min_bound = np.maximum(min_bound, np.clip(mn_n, 0.0, 1.0))
+            max_bound = np.minimum(max_bound, np.clip(mx_n, 0.0, 1.0))
         x = np.linspace(min_bound[0], max_bound[0], self.grid_resolution)
         y = np.linspace(min_bound[1], max_bound[1], self.grid_resolution)
         z = np.linspace(min_bound[2], max_bound[2], self.grid_resolution)
@@ -188,6 +251,21 @@ class TrainingVisualizer:
         batch_size = 64 * 64 * 64  # Process in chunks
         
         with torch.no_grad():
+            # Conditional models need view conditioning for meaningful evaluation.
+            cond_kwargs = {}
+            views_feats = None
+            if sample_batch is not None and 'views_rgb' in sample_batch and hasattr(self.model, 'encode_views'):
+                views_rgb = sample_batch['views_rgb'].to(self.device)
+                views_pose = sample_batch['views_pose'].to(self.device)
+                views_K = sample_batch['views_K'].to(self.device)
+                views_feats = self.model.encode_views(views_rgb)
+                cond_kwargs = dict(
+                    views_rgb=views_rgb,
+                    views_pose=views_pose,
+                    views_K=views_K,
+                    views_feats=views_feats,
+                )
+
             for i, xi in enumerate(x):
                 # Create grid slice
                 yy, zz = np.meshgrid(y, z, indexing='ij')
@@ -196,8 +274,12 @@ class TrainingVisualizer:
                 points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=-1)
                 points_tensor = torch.from_numpy(points).float().to(self.device)
                 
-                # Query model (expects normalized coords)
-                output = self.model(points_tensor.unsqueeze(0))
+                # Query model (expects normalized coords); conditional models also need world coords.
+                if cond_kwargs:
+                    world_pts = torch.from_numpy(self._denormalize_points(points)).float().to(self.device)
+                    output = self.model(points_tensor.unsqueeze(0), world_coords=world_pts.unsqueeze(0), **cond_kwargs)
+                else:
+                    output = self.model(points_tensor.unsqueeze(0))
                 sdf = output['sdf'].squeeze().cpu().numpy()
                 
                 sdf_grid[i] = sdf.reshape(self.grid_resolution, self.grid_resolution)
@@ -430,11 +512,20 @@ class TrainingVisualizer:
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
     
-    def _visualize_sdf_slices(self, epoch: int, save_dir: Path):
+    def _visualize_sdf_slices(self, epoch: int, save_dir: Path, sample_batch: Optional[Dict[str, torch.Tensor]] = None):
         """Visualize 2D slices through the SDF volume."""
         self.model.eval()
         
         min_bound, max_bound = self.bounds
+        if sample_batch is not None and 'views_pose' in sample_batch and self.scene_bounds is not None:
+            cam_centers = sample_batch['views_pose'][0, :, :3, 3].detach().cpu().numpy()
+            margin = 10.0
+            mn_w = cam_centers.min(axis=0) - margin
+            mx_w = cam_centers.max(axis=0) + margin
+            mn_n = self._normalize_points(mn_w[None, :])[0]
+            mx_n = self._normalize_points(mx_w[None, :])[0]
+            min_bound = np.maximum(min_bound, np.clip(mn_n, 0.0, 1.0))
+            max_bound = np.minimum(max_bound, np.clip(mx_n, 0.0, 1.0))
         resolution = 256
         
         fig, axes = plt.subplots(2, 3, figsize=(15, 10))
@@ -442,6 +533,19 @@ class TrainingVisualizer:
         slice_positions = [0.25, 0.5, 0.75]  # Relative positions
         
         with torch.no_grad():
+            cond_kwargs = {}
+            if sample_batch is not None and 'views_rgb' in sample_batch and hasattr(self.model, 'encode_views'):
+                views_rgb = sample_batch['views_rgb'].to(self.device)
+                views_pose = sample_batch['views_pose'].to(self.device)
+                views_K = sample_batch['views_K'].to(self.device)
+                views_feats = self.model.encode_views(views_rgb)
+                cond_kwargs = dict(
+                    views_rgb=views_rgb,
+                    views_pose=views_pose,
+                    views_K=views_K,
+                    views_feats=views_feats,
+                )
+
             # XY slices (varying Z)
             for col, z_rel in enumerate(slice_positions):
                 z = min_bound[2] + z_rel * (max_bound[2] - min_bound[2])
@@ -454,7 +558,11 @@ class TrainingVisualizer:
                 points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=-1)
                 points_tensor = torch.from_numpy(points).float().to(self.device)
                 
-                output = self.model(points_tensor.unsqueeze(0))
+                if cond_kwargs:
+                    world_pts = torch.from_numpy(self._denormalize_points(points)).float().to(self.device)
+                    output = self.model(points_tensor.unsqueeze(0), world_coords=world_pts.unsqueeze(0), **cond_kwargs)
+                else:
+                    output = self.model(points_tensor.unsqueeze(0))
                 sdf = output['sdf'].squeeze().cpu().numpy().reshape(resolution, resolution)
                 
                 ax = axes[0, col]
@@ -478,7 +586,11 @@ class TrainingVisualizer:
                 points = np.stack([xx.ravel(), yy.ravel(), zz.ravel()], axis=-1)
                 points_tensor = torch.from_numpy(points).float().to(self.device)
                 
-                output = self.model(points_tensor.unsqueeze(0))
+                if cond_kwargs:
+                    world_pts = torch.from_numpy(self._denormalize_points(points)).float().to(self.device)
+                    output = self.model(points_tensor.unsqueeze(0), world_coords=world_pts.unsqueeze(0), **cond_kwargs)
+                else:
+                    output = self.model(points_tensor.unsqueeze(0))
                 sdf = output['sdf'].squeeze().cpu().numpy().reshape(resolution, resolution)
                 
                 ax = axes[1, col]
@@ -502,10 +614,12 @@ class TrainingVisualizer:
         save_dir: Path,
     ):
         """Compare input depth with rendered depth from SDF."""
-        if 'depth' not in batch:
+        if 'depth' in batch:
+            depth_gt = batch['depth'][0].cpu().numpy()
+        elif 'views_depth' in batch:
+            depth_gt = batch['views_depth'][0, 0].cpu().numpy()
+        else:
             return
-            
-        depth_gt = batch['depth'][0].cpu().numpy()
         
         fig, axes = plt.subplots(1, 3, figsize=(15, 5))
         

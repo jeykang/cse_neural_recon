@@ -75,6 +75,8 @@ class TrainingConfig:
     # TSDF supervision
     use_tsdf_supervision: bool = True
     truncation_dist: float = 0.2  # meters
+    # For debugging/visualization: report approximate world-space scale.
+    report_scene_scale: bool = True
     
     # Training options
     use_amp: bool = True
@@ -83,7 +85,12 @@ class TrainingConfig:
     # Metrics collection (for cross-device comparison)
     collect_metrics: bool = True  # Enable detailed metrics collection by default
     metrics_sample_rate: int = 10  # Sample GPU metrics every N batches
-    
+
+    # Visualization/debugging
+    viz_num_batches: int = 4  # Cache N different batches for visualization
+    viz_frames_per_sequence: int = 20  # Frames sampled per sequence for GT subsets
+    viz_max_points_per_sequence: int = 50000  # Subsample per-sequence GT for speed
+
     # Logging
     log_every: int = 100
     val_every: int = 1
@@ -158,7 +165,9 @@ class Trainer:
         
         # Cache a sample batch for visualization
         self._viz_batch = None
+        self._viz_batches: List[Dict[str, Any]] = []
         self._gt_points = None
+        self._gt_points_by_sequence: Optional[Dict[str, np.ndarray]] = None
         
         # Productivity metrics collection (enabled by default for cross-device comparison)
         self.productivity_collector = None
@@ -598,15 +607,137 @@ class Trainer:
             components: Dictionary of loss components
         """
         self.optimizer.zero_grad()
+
+        # Multi-view conditional mode: batch provides a set of views (rgb/depth/pose/K).
+        is_multiview = 'views_rgb' in batch and 'views_pose' in batch and 'views_K' in batch
+
+        # Guardrail: conditional models require view conditioning.
+        if hasattr(self.model, 'encode_views') and not is_multiview:
+            raise ValueError(
+                "Conditional model requires `views_*` tensors in the batch. "
+                "Enable `data.multiview.enabled: true` (and ensure `views_depth` is present for training)."
+            )
+
+        if is_multiview:
+            views_rgb = batch['views_rgb']  # (B, V, 3, H, W)
+            views_pose = batch['views_pose']  # (B, V, 4, 4)
+            views_K = batch['views_K']  # (B, V, 3, 3)
+            views_depth = batch.get('views_depth', None)  # (B, V, H, W)
+            views_valid_mask = batch.get('views_valid_mask', None)
+
+            B, V, _, H, W = views_rgb.shape
+
+            # Precompute view features once (if supported).
+            views_feats = None
+            if hasattr(self.model, 'encode_views'):
+                views_feats = self.model.encode_views(views_rgb)
+
+            # Distribute sampling budget across views to keep total compute similar.
+            orig_surface = int(self.config.num_surface_samples)
+            orig_free = int(self.config.num_freespace_samples)
+            orig_rand = int(self.config.num_random_samples)
+            per_view_div = max(1, int(V))
+            self.config.num_surface_samples = max(256, orig_surface // per_view_div)
+            self.config.num_freespace_samples = max(256, orig_free // per_view_div)
+            self.config.num_random_samples = max(128, orig_rand // per_view_div)
+
+            total_loss = 0.0
+            sum_components: Dict[str, float] = {}
+
+            for v in range(int(V)):
+                if views_depth is None:
+                    raise ValueError("views_depth is required for multiview supervision")
+                depth = views_depth[:, v]  # (B, H, W)
+                pose = views_pose[:, v]  # (B, 4, 4)
+                K = views_K[:, v]  # (B, 3, 3)
+                valid_mask = (
+                    views_valid_mask[:, v]
+                    if views_valid_mask is not None
+                    else (depth > 0)
+                )
+
+                loss_v, comps_v = self._train_step_single_view(
+                    depth=depth,
+                    pose=pose,
+                    K=K,
+                    valid_mask=valid_mask,
+                    views_rgb=views_rgb,
+                    views_pose=views_pose,
+                    views_K=views_K,
+                    views_feats=views_feats,
+                )
+                total_loss = total_loss + loss_v
+                for k, val in comps_v.items():
+                    sum_components[k] = sum_components.get(k, 0.0) + float(val)
+
+            # Restore config values.
+            self.config.num_surface_samples = orig_surface
+            self.config.num_freespace_samples = orig_free
+            self.config.num_random_samples = orig_rand
+
+            loss = total_loss / float(V)
+            components = {k: v / float(V) for k, v in sum_components.items()}
+        else:
+            # Extract data from batch
+            depth = batch['depth']  # (B, H, W)
+            pose = batch['pose']    # (B, 4, 4)
+            K = batch['K']          # (B, 3, 3)
+            valid_mask = batch.get('valid_mask', depth > 0)
+            B, H, W = depth.shape
+
+            loss, components = self._train_step_single_view(
+                depth=depth,
+                pose=pose,
+                K=K,
+                valid_mask=valid_mask,
+                views_rgb=None,
+                views_pose=None,
+                views_K=None,
+                views_feats=None,
+            )
         
-        # Extract data from batch
-        depth = batch['depth']  # (B, H, W)
-        pose = batch['pose']    # (B, 4, 4)
-        K = batch['K']          # (B, 3, 3)
-        valid_mask = batch.get('valid_mask', depth > 0)
-        
+        # Backward pass
+        if self.scaler is not None:
+            self.scaler.scale(loss).backward()
+            
+            if self.config.grad_clip > 0:
+                self.scaler.unscale_(self.optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.config.grad_clip
+                )
+                
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            
+            if self.config.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.config.grad_clip
+                )
+                
+            self.optimizer.step()
+
+        return loss, components
+
+    def _train_step_single_view(
+        self,
+        *,
+        depth: torch.Tensor,
+        pose: torch.Tensor,
+        K: torch.Tensor,
+        valid_mask: torch.Tensor,
+        views_rgb: Optional[torch.Tensor],
+        views_pose: Optional[torch.Tensor],
+        views_K: Optional[torch.Tensor],
+        views_feats: Optional[torch.Tensor],
+    ) -> tuple:
+        """
+        Internal helper that computes loss/metrics for a single supervising view.
+        In conditional mode, `views_*` represent the full viewset used for conditioning.
+        """
         B, H, W = depth.shape
-        
+
         # Scene scale for normalizing SDF targets (world meters per normalized unit).
         # This matches the isotropic normalization cube used by `_normalize_coords`.
         scene_scale = float(getattr(self, 'scene_scale', (self.scene_max - self.scene_min).max().item()))
@@ -665,21 +796,61 @@ class Trainer:
         with autocast(enabled=self.config.use_amp):
             # TSDF points (optional)
             if tsdf_points.shape[1] > 0:
-                tsdf_out = self.model(tsdf_points)
+                if views_rgb is not None and hasattr(self.model, 'encode_views'):
+                    tsdf_out = self.model(
+                        tsdf_points,
+                        world_coords=tsdf_points_world,
+                        views_rgb=views_rgb,
+                        views_pose=views_pose,
+                        views_K=views_K,
+                        views_feats=views_feats,
+                    )
+                else:
+                    tsdf_out = self.model(tsdf_points)
                 sdf_tsdf = tsdf_out['sdf'].squeeze(-1)  # (B, N)
             else:
                 sdf_tsdf = None
             
             # Surface points
-            surface_out = self.model(surface_points)
+            if views_rgb is not None and hasattr(self.model, 'encode_views'):
+                surface_out = self.model(
+                    surface_points,
+                    world_coords=surface_points_world,
+                    views_rgb=views_rgb,
+                    views_pose=views_pose,
+                    views_K=views_K,
+                    views_feats=views_feats,
+                )
+            else:
+                surface_out = self.model(surface_points)
             sdf_surface = surface_out['sdf']
             
             # Freespace points (in front of observed depth)
-            freespace_out = self.model(freespace_points)
+            if views_rgb is not None and hasattr(self.model, 'encode_views'):
+                freespace_out = self.model(
+                    freespace_points,
+                    world_coords=freespace_points_world,
+                    views_rgb=views_rgb,
+                    views_pose=views_pose,
+                    views_K=views_K,
+                    views_feats=views_feats,
+                )
+            else:
+                freespace_out = self.model(freespace_points)
             sdf_freespace = freespace_out['sdf'].squeeze(-1)
             
             # Random points (weak outside prior)
-            random_out = self.model(random_points)
+            if views_rgb is not None and hasattr(self.model, 'encode_views'):
+                random_out = self.model(
+                    random_points,
+                    world_coords=random_points_world,
+                    views_rgb=views_rgb,
+                    views_pose=views_pose,
+                    views_K=views_K,
+                    views_feats=views_feats,
+                )
+            else:
+                random_out = self.model(random_points)
             sdf_random = random_out['sdf'].squeeze(-1)
             
             # === TSDF Loss (most important) ===
@@ -753,28 +924,6 @@ class Trainer:
             self.config.eikonal_weight * loss_eikonal
         )
             
-        # Backward pass
-        if self.scaler is not None:
-            self.scaler.scale(loss).backward()
-            
-            if self.config.grad_clip > 0:
-                self.scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.grad_clip
-                )
-                
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
-        else:
-            loss.backward()
-            
-            if self.config.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.model.parameters(), self.config.grad_clip
-                )
-                
-            self.optimizer.step()
-            
         components = {
             'tsdf': loss_tsdf.item(),
             'surface': loss_surface.item(),
@@ -800,6 +949,15 @@ class Trainer:
                     'sdf_tsdf_std': sdf_tsdf_flat.std().item(),
                     'tsdf_target_mean': tsdf_target_flat.mean().item(),
                     'tsdf_target_std': tsdf_target_flat.std().item(),
+                }
+            )
+
+        if bool(getattr(self.config, 'report_scene_scale', True)):
+            components.update(
+                {
+                    'scene_scale_m': float(scene_scale),
+                    'truncation_m': float(truncation_world),
+                    'truncation_norm': float(truncation_normalized),
                 }
             )
         
@@ -1188,51 +1346,81 @@ class Trainer:
             print("Caching GT points from across dataset...")
             all_points = []
             max_batches = min(100, len(self.train_loader))  # Sample up to 100 batches
+            num_viz_batches = max(1, int(getattr(self.config, 'viz_num_batches', 4)))
+            self._viz_batches = []
             
             for i, batch in enumerate(self.train_loader):
                 if i >= max_batches:
                     break
                 
-                # Only cache the first batch for visualization
-                if i == 0:
-                    self._viz_batch = {k: v.clone() if torch.is_tensor(v) else v 
-                                       for k, v in batch.items()}
+                # Cache a few batches for visualization so GT/depth views can vary.
+                if len(self._viz_batches) < num_viz_batches:
+                    self._viz_batches.append(
+                        {k: v.clone() if torch.is_tensor(v) else v for k, v in batch.items()}
+                    )
                 
                 # Extract points from this batch
-                depth = batch['depth']
-                pose = batch['pose']
-                K = batch['K']
-                valid_mask = batch.get('valid_mask', depth > 0)
-                
-                B, H, W = depth.shape
-                
-                for b in range(B):
-                    valid = valid_mask[b]
-                    v, u = torch.where(valid)
+                if 'views_depth' in batch and 'views_pose' in batch and 'views_K' in batch:
+                    views_depth = batch['views_depth']  # (B, V, H, W)
+                    views_pose = batch['views_pose']  # (B, V, 4, 4)
+                    views_K = batch['views_K']  # (B, V, 3, 3)
+                    views_valid = batch.get('views_valid_mask', views_depth > 0)
+                    B, V, H, W = views_depth.shape
+                    for b in range(B):
+                        for vi in range(V):
+                            valid = views_valid[b, vi]
+                            vv, uu = torch.where(valid)
+                            if len(vv) < 100:
+                                continue
+                            sample_idx = torch.randperm(len(vv))[:1000]
+                            vv, uu = vv[sample_idx], uu[sample_idx]
+                            z = views_depth[b, vi, vv, uu]
+                            Kb = views_K[b, vi]
+                            fx, fy = Kb[0, 0], Kb[1, 1]
+                            cx, cy = Kb[0, 2], Kb[1, 2]
+                            x = (uu.float() - cx) * z / fx
+                            y = (vv.float() - cy) * z / fy
+                            pts_cam = torch.stack([x, y, z], dim=-1)
+                            pose_b = views_pose[b, vi]
+                            R = pose_b[:3, :3]
+                            t = pose_b[:3, 3]
+                            pts_world = pts_cam @ R.T + t
+                            all_points.append(pts_world.cpu().numpy())
+                else:
+                    depth = batch['depth']
+                    pose = batch['pose']
+                    K = batch['K']
+                    valid_mask = batch.get('valid_mask', depth > 0)
                     
-                    if len(v) < 100:
-                        continue
+                    B, H, W = depth.shape
                     
-                    # Subsample each frame
-                    sample_idx = torch.randperm(len(v))[:1000]
-                    v, u = v[sample_idx], u[sample_idx]
-                    z = depth[b, v, u]
-                    
-                    # Back-project
-                    fx, fy = K[b, 0, 0], K[b, 1, 1]
-                    cx, cy = K[b, 0, 2], K[b, 1, 2]
-                    
-                    x = (u.float() - cx) * z / fx
-                    y = (v.float() - cy) * z / fy
-                    
-                    pts_cam = torch.stack([x, y, z], dim=-1)
-                    
-                    # Transform to world
-                    R = pose[b, :3, :3]
-                    t = pose[b, :3, 3]
-                    pts_world = pts_cam @ R.T + t
-                    
-                    all_points.append(pts_world.cpu().numpy())
+                    for b in range(B):
+                        valid = valid_mask[b]
+                        v, u = torch.where(valid)
+                        
+                        if len(v) < 100:
+                            continue
+                        
+                        # Subsample each frame
+                        sample_idx = torch.randperm(len(v))[:1000]
+                        v, u = v[sample_idx], u[sample_idx]
+                        z = depth[b, v, u]
+                        
+                        # Back-project
+                        fx, fy = K[b, 0, 0], K[b, 1, 1]
+                        cx, cy = K[b, 0, 2], K[b, 1, 2]
+                        
+                        x = (u.float() - cx) * z / fx
+                        y = (v.float() - cy) * z / fy
+                        
+                        pts_cam = torch.stack([x, y, z], dim=-1)
+                        
+                        # Transform to world
+                        R = pose[b, :3, :3]
+                        t = pose[b, :3, 3]
+                        pts_world = pts_cam @ R.T + t
+                        
+                        all_points.append(pts_world.cpu().numpy())
             
             if all_points:
                 self._gt_points = np.concatenate(all_points, axis=0)
@@ -1250,13 +1438,91 @@ class Trainer:
             else:
                 print("Warning: No valid GT points found")
                 self._gt_points = None
+
+            # Build per-sequence GT subsets if this is a concatenated dataset.
+            self._gt_points_by_sequence = None
+            try:
+                from torch.utils.data import ConcatDataset
+                dataset = self.train_loader.dataset
+                base_dataset = getattr(dataset, 'base', dataset)
+                if isinstance(base_dataset, ConcatDataset) and hasattr(base_dataset, 'datasets'):
+                    gt_by_seq: Dict[str, List[np.ndarray]] = {}
+                    frames_per_seq = int(getattr(self.config, 'viz_frames_per_sequence', 20))
+                    max_points_per_seq = int(getattr(self.config, 'viz_max_points_per_sequence', 50000))
+
+                    print("Caching per-sequence GT point subsets...")
+                    for ds_i, sub_ds in enumerate(base_dataset.datasets):
+                        run_dir = getattr(sub_ds, 'run_dir', None)
+                        seq_name = os.path.basename(run_dir) if isinstance(run_dir, str) else f"dataset_{ds_i}"
+
+                        n_frames = min(frames_per_seq, len(sub_ds))
+                        if n_frames <= 0:
+                            continue
+                        sample_indices = np.random.choice(len(sub_ds), size=n_frames, replace=False)
+
+                        for idx in sample_indices:
+                            sample = sub_ds[int(idx)]
+                            # Handle multi-camera sample structure.
+                            view_samples: List[Dict[str, torch.Tensor]] = []
+                            if isinstance(sample, dict) and 'rgb' in sample and 'pose' in sample and 'K' in sample:
+                                view_samples = [sample]
+                            elif isinstance(sample, dict):
+                                for k, v in sample.items():
+                                    if k == 'timestamp':
+                                        continue
+                                    if isinstance(v, dict) and 'pose' in v and 'K' in v:
+                                        view_samples.append(v)
+
+                            for vs in view_samples:
+                                if 'depth' not in vs:
+                                    continue
+                                depth = vs['depth']
+                                pose = vs['pose']
+                                K = vs['K']
+                                valid_mask = vs.get('valid_mask', depth > 0)
+
+                                v, u = torch.where(valid_mask)
+                                if len(v) < 100:
+                                    continue
+                                sample_idx = torch.randperm(len(v))[:1000]
+                                v, u = v[sample_idx], u[sample_idx]
+                                z = depth[v, u]
+
+                                fx, fy = K[0, 0], K[1, 1]
+                                cx, cy = K[0, 2], K[1, 2]
+                                x = (u.float() - cx) * z / fx
+                                y = (v.float() - cy) * z / fy
+                                pts_cam = torch.stack([x, y, z], dim=-1)
+
+                                R = pose[:3, :3]
+                                t = pose[:3, 3]
+                                pts_world = pts_cam @ R.T + t
+
+                                gt_by_seq.setdefault(seq_name, []).append(pts_world.cpu().numpy())
+
+                    if gt_by_seq:
+                        self._gt_points_by_sequence = {}
+                        for seq_name, chunks in gt_by_seq.items():
+                            pts = np.concatenate(chunks, axis=0) if chunks else np.zeros((0, 3))
+                            if len(pts) > max_points_per_seq:
+                                idx = np.random.choice(len(pts), max_points_per_seq, replace=False)
+                                pts = pts[idx]
+                            if len(pts) > 0:
+                                self._gt_points_by_sequence[seq_name] = pts
+                        if self._gt_points_by_sequence:
+                            print(f"Cached per-sequence GT subsets: {list(self._gt_points_by_sequence.keys())}")
+            except Exception as e:
+                print(f"Warning: Failed to cache per-sequence GT subsets: {e}")
+                self._gt_points_by_sequence = None
                     
         except Exception as e:
             print(f"Warning: Could not cache visualization batch: {e}")
             import traceback
             traceback.print_exc()
             self._viz_batch = None
+            self._viz_batches = []
             self._gt_points = None
+            self._gt_points_by_sequence = None
     
     def _generate_visualizations(
         self, 
@@ -1271,12 +1537,23 @@ class Trainer:
         print(f"Generating visualizations for epoch {epoch}...")
         
         try:
+            # Pick a different batch each time so depth/GT views vary.
+            viz_batch = None
+            if self._viz_batches:
+                viz_batch = self._viz_batches[np.random.randint(len(self._viz_batches))]
+            elif self._viz_batch is not None:
+                viz_batch = self._viz_batch
+
+            # Provide per-sequence GT subsets if available (helps detect "learned one room" issues).
+            gt_groups = self._gt_points_by_sequence if isinstance(self._gt_points_by_sequence, dict) else None
+
             eval_metrics = self.visualizer.visualize_checkpoint(
                 epoch=epoch,
                 train_metrics=train_metrics,
                 val_metrics=val_metrics,
-                sample_batch=self._viz_batch,
+                sample_batch=viz_batch,
                 gt_points=self._gt_points,
+                gt_groups=gt_groups,
             )
             
             # Log evaluation metrics

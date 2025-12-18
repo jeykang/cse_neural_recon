@@ -17,13 +17,21 @@ from datetime import datetime
 import yaml
 import torch
 import torch.nn as nn
+import numpy as np
 
 # Add project root to path
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.data import CSEDataset, create_multi_sequence_dataset, create_multi_environment_dataset
-from src.models import NeuralSDF, NeuralSDFWithPlanar, HashGridSDF
+from src.data import (
+    CSEDataset,
+    CSEMultiCameraDataset,
+    create_multi_sequence_dataset,
+    create_multi_environment_dataset,
+    CSEViewSetDataset,
+    MultiViewConfig,
+)
+from src.models import NeuralSDF, NeuralSDFWithPlanar, HashGridSDF, PixelAlignedConditionalSDF
 from src.losses import SDFLoss, PlanarConsistencyLoss, ManhattanLoss
 from src.training import Trainer, TrainingConfig
 from src.utils.auto_batch_size import auto_batch_size_for_sdf, get_gpu_memory_info
@@ -110,6 +118,21 @@ def create_model(config: dict, device: str = 'cuda') -> nn.Module:
     
     hidden_features = sdf_config.get('hidden_features', 256)
     hidden_layers = sdf_config.get('hidden_layers', 6)
+
+    # Conditional pixel-aligned model (multi-view RGB(+pose) -> local geometry).
+    if bool(sdf_config.get('conditional', False)):
+        cond_cfg = sdf_config.get('conditioning', {}) or {}
+        model = PixelAlignedConditionalSDF(
+            encoding_config=encoding_config,
+            cond_dim=int(cond_cfg.get('cond_dim', 64)),
+            encoder_out_dim=int(cond_cfg.get('encoder_out_dim', 64)),
+            hidden_features=hidden_features,
+            hidden_layers=hidden_layers,
+            use_weight_norm=bool(sdf_config.get('use_weight_norm', True)),
+        )
+        num_params = sum(p.numel() for p in model.parameters())
+        print(f"Conditional model parameters: {num_params:,}")
+        return model.to(device)
     
     # Use HashGridSDF when encoding is hashgrid (proper architecture for hash grids)
     use_planar = planar_config.get('enabled', False)  # Disable planar by default for stability
@@ -193,6 +216,38 @@ def create_dataset(config: dict):
         depth_scale=depth_scale,
         cache_frames=data_config.get('cache_frames', False),
     )
+
+    # Multi-view wrapper configuration (optional)
+    mv_cfg = data_config.get('multiview', {}) or {}
+    use_multiview = bool(mv_cfg.get('enabled', False))
+    # Conditional SDF requires a viewset batch format.
+    is_conditional = bool(config.get('model', {}).get('neural_sdf', {}).get('conditional', False))
+    if is_conditional:
+        use_multiview = True
+    mv_num_views = int(mv_cfg.get('num_views', 6))
+    mv_window = int(mv_cfg.get('window', 6))
+    mv_include_ref = bool(mv_cfg.get('include_reference', True))
+
+    # Stereo multi-camera dataset (optional; useful as 2 views per timestamp).
+    multicam_cfg = data_config.get('multicamera', {}) or {}
+    use_multicamera = bool(multicam_cfg.get('enabled', False))
+    cameras = multicam_cfg.get('cameras', None)
+    sync_tolerance = float(multicam_cfg.get('sync_tolerance', 0.05))
+    # Normalize camera config (YAML-friendly).
+    if isinstance(cameras, list) and cameras:
+        if all(isinstance(c, str) for c in cameras):
+            # Let CSEMultiCameraDataset use its default stereo pair.
+            cameras = None
+        else:
+            norm = []
+            for cam in cameras:
+                if not isinstance(cam, dict) or 'side' not in cam:
+                    raise ValueError("multicamera.cameras must be a list of {side, extrinsic} dicts or omitted")
+                extr = cam.get('extrinsic', None)
+                if extr is not None and not isinstance(extr, np.ndarray):
+                    extr = np.array(extr, dtype=np.float32)
+                norm.append({'side': cam['side'], 'extrinsic': extr if extr is not None else np.eye(4, dtype=np.float32)})
+            cameras = norm
     
     # Check for multi-environment training (highest priority)
     multi_environment = data_config.get('multi_environment', False)
@@ -216,15 +271,67 @@ def create_dataset(config: dict):
             base_dir = os.path.dirname(data_path)
         
         print(f"Loading multi-sequence dataset from {base_dir}")
-        dataset = create_multi_sequence_dataset(
-            base_dir=base_dir,
-            sequences=sequences,
-            pattern=sequence_pattern,
-            **dataset_kwargs
-        )
+        if use_multicamera:
+            # Build a ConcatDataset of multi-camera datasets for each sequence.
+            seqs = sequences
+            if seqs is None:
+                import glob
+                seq_dirs = sorted(glob.glob(os.path.join(base_dir, sequence_pattern)))
+                seqs = [os.path.basename(d) for d in seq_dirs if os.path.isdir(d)]
+            if not seqs:
+                raise ValueError(f"No sequences found in {base_dir} matching {sequence_pattern}")
+            cams = cameras  # None => dataset default stereo extrinsic
+            datasets = []
+            for seq_name in seqs:
+                seq_path = os.path.join(base_dir, seq_name)
+                if not os.path.isdir(seq_path):
+                    continue
+                datasets.append(
+                    CSEMultiCameraDataset(
+                        run_dir=seq_path,
+                        cameras=cams,
+                        img_wh=(img_width, img_height),
+                        sync_tolerance=sync_tolerance,
+                        min_depth=min_depth,
+                        max_depth=max_depth,
+                        depth_scale=depth_scale,
+                        cache_frames=data_config.get('cache_frames', False),
+                    )
+                )
+            dataset = torch.utils.data.ConcatDataset(datasets)
+        else:
+            dataset = create_multi_sequence_dataset(
+                base_dir=base_dir,
+                sequences=sequences,
+                pattern=sequence_pattern,
+                **dataset_kwargs
+            )
     else:
         # Single sequence mode
-        dataset = CSEDataset(run_dir=str(data_path), **dataset_kwargs)
+        if use_multicamera:
+            cams = cameras  # None => dataset default stereo extrinsic
+            dataset = CSEMultiCameraDataset(
+                run_dir=str(data_path),
+                cameras=cams,
+                img_wh=(img_width, img_height),
+                sync_tolerance=sync_tolerance,
+                min_depth=min_depth,
+                max_depth=max_depth,
+                depth_scale=depth_scale,
+                cache_frames=data_config.get('cache_frames', False),
+            )
+        else:
+            dataset = CSEDataset(run_dir=str(data_path), **dataset_kwargs)
+
+    if use_multiview:
+        dataset = CSEViewSetDataset(
+            dataset,
+            config=MultiViewConfig(
+                num_views=mv_num_views,
+                window=mv_window,
+                include_reference=mv_include_ref,
+            ),
+        )
     
     return dataset
 
@@ -371,6 +478,12 @@ def main():
     # Auto batch size scaling
     train_config = config.get('training', {})
     auto_batch = getattr(args, 'auto_batch_size', False)
+    # Auto batch size profiling does not account for multi-view image encoder memory.
+    # In conditional mode, it tends to recommend absurdly large batch sizes.
+    if hasattr(model, 'encode_views') or bool(config.get('data', {}).get('multiview', {}).get('enabled', False)):
+        if auto_batch:
+            logger.info("Disabling --auto-batch-size for multi-view/conditional training (encoder memory not profiled).")
+        auto_batch = False
     
     if auto_batch and torch.cuda.is_available():
         logger.info("=" * 60)

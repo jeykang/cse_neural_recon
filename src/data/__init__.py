@@ -8,6 +8,7 @@ from .dataset import (
     create_multi_sequence_dataset,
     create_multi_environment_dataset,
 )
+from .multiview import CSEViewSetDataset, MultiViewConfig
 from .coordinate_system import UnifiedCoordinateSystem, EnvironmentBounds
 from .multi_camera import MultiCameraSynchronizer, CameraRig
 from .transforms import DataAugmentation, DepthTransforms
@@ -18,6 +19,8 @@ __all__ = [
     'CSEMultiCameraDataset',
     'create_multi_sequence_dataset',
     'create_multi_environment_dataset',
+    'CSEViewSetDataset',
+    'MultiViewConfig',
     'UnifiedCoordinateSystem',
     'EnvironmentBounds',
     'MultiCameraSynchronizer',
