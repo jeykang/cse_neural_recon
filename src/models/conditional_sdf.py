@@ -16,6 +16,7 @@ from typing import Dict, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.amp import autocast
 
 from .encodings import HashGridEncoding
 
@@ -174,56 +175,70 @@ class PixelAlignedConditionalSDF(nn.Module):
         feats: torch.Tensor,  # (B, V, C, Hf, Wf)
         image_hw: Tuple[int, int],
     ) -> torch.Tensor:
-        B, N, _ = world_coords.shape
-        V = views_pose.shape[1]
-        H, W = int(image_hw[0]), int(image_hw[1])
-        Hf, Wf = int(feats.shape[-2]), int(feats.shape[-1])
+        # Projection math is numerically sensitive (especially for random points near
+        # the camera plane). Do it in FP32 even when the outer forward is under AMP.
+        device_type = world_coords.device.type
+        with autocast(device_type=device_type, enabled=False):
+            world_coords = world_coords.float()
+            views_pose = views_pose.float()
+            views_K = views_K.float()
+            feats = feats.float()
 
-        # Prepare for vectorized projection: expand points across V.
-        pts = world_coords[:, None, :, :].expand(B, V, N, 3)  # (B, V, N, 3)
-        R_wc, t_wc = self._invert_pose(views_pose)  # (B, V, 3, 3), (B, V, 3)
+            B, N, _ = world_coords.shape
+            V = views_pose.shape[1]
+            H, W = int(image_hw[0]), int(image_hw[1])
+            Hf, Wf = int(feats.shape[-2]), int(feats.shape[-1])
 
-        # Transform to camera coordinates.
-        pts_cam = (R_wc[:, :, None, :, :] @ pts.unsqueeze(-1)).squeeze(-1) + t_wc[:, :, None, :]  # (B, V, N, 3)
-        x, y, z = pts_cam[..., 0], pts_cam[..., 1], pts_cam[..., 2].clamp(min=1e-6)
+            # Prepare for vectorized projection: expand points across V.
+            pts = world_coords[:, None, :, :].expand(B, V, N, 3)  # (B, V, N, 3)
+            R_wc, t_wc = self._invert_pose(views_pose)  # (B, V, 3, 3), (B, V, 3)
 
-        fx = views_K[..., 0, 0][:, :, None]
-        fy = views_K[..., 1, 1][:, :, None]
-        cx = views_K[..., 0, 2][:, :, None]
-        cy = views_K[..., 1, 2][:, :, None]
+            # Transform to camera coordinates.
+            pts_cam = (R_wc[:, :, None, :, :] @ pts.unsqueeze(-1)).squeeze(-1) + t_wc[:, :, None, :]  # (B, V, N, 3)
+            x, y, z = pts_cam[..., 0], pts_cam[..., 1], pts_cam[..., 2]
 
-        u = fx * (x / z) + cx
-        v = fy * (y / z) + cy
+            fx = views_K[..., 0, 0][:, :, None]
+            fy = views_K[..., 1, 1][:, :, None]
+            cx = views_K[..., 0, 2][:, :, None]
+            cy = views_K[..., 1, 2][:, :, None]
 
-        # Points behind the camera or outside image are treated as invalid.
-        valid = (pts_cam[..., 2] > 0) & (u >= 0) & (u <= (W - 1)) & (v >= 0) & (v <= (H - 1))
+            # Guard against points extremely close to the camera plane, which can
+            # overflow under AMP and poison the whole batch with NaNs.
+            z_min = 1e-2
+            z_safe = z.clamp(min=z_min)
+            u = fx * (x / z_safe) + cx
+            v = fy * (y / z_safe) + cy
 
-        # Map to feature-map normalized coordinates for grid_sample.
-        # Scale pixel coords to feature map resolution first.
-        u_f = u * (Wf - 1) / max(W - 1, 1)
-        v_f = v * (Hf - 1) / max(H - 1, 1)
-        grid_x = (u_f / max(Wf - 1, 1)) * 2 - 1
-        grid_y = (v_f / max(Hf - 1, 1)) * 2 - 1
-        grid = torch.stack([grid_x, grid_y], dim=-1)  # (B, V, N, 2)
+            # Points behind the camera / too close to plane / outside image are invalid.
+            valid = (z > z_min) & (u >= 0) & (u <= (W - 1)) & (v >= 0) & (v <= (H - 1))
 
-        # grid_sample expects (N, H_out, W_out, 2); we sample N points as a 1D "strip".
-        feats_bv = feats.reshape(B * V, feats.shape[2], Hf, Wf)
-        grid_bv = grid.reshape(B * V, N, 1, 2)
-        sampled = F.grid_sample(
-            feats_bv,
-            grid_bv,
-            mode='bilinear',
-            padding_mode='zeros',
-            align_corners=True,
-        )  # (B*V, C, N, 1)
-        sampled = sampled.squeeze(-1).transpose(1, 2)  # (B*V, N, C)
-        sampled = sampled.reshape(B, V, N, -1)  # (B, V, N, C)
+            # Map to feature-map normalized coordinates for grid_sample.
+            u_f = u * (Wf - 1) / max(W - 1, 1)
+            v_f = v * (Hf - 1) / max(H - 1, 1)
+            grid_x = (u_f / max(Wf - 1, 1)) * 2 - 1
+            grid_y = (v_f / max(Hf - 1, 1)) * 2 - 1
+            grid = torch.stack([grid_x, grid_y], dim=-1)  # (B, V, N, 2)
+            # Ensure invalid points don't introduce NaNs/Infs into grid_sample.
+            grid = torch.where(valid.unsqueeze(-1), grid, torch.zeros_like(grid))
 
-        valid_f = valid.float().unsqueeze(-1)  # (B, V, N, 1)
-        sampled = sampled * valid_f
-        denom = valid_f.sum(dim=1).clamp(min=1.0)  # (B, N, 1)
-        cond = sampled.sum(dim=1) / denom  # (B, N, C)
-        return cond
+            # grid_sample expects (N, H_out, W_out, 2); we sample N points as a 1D "strip".
+            feats_bv = feats.reshape(B * V, feats.shape[2], Hf, Wf)
+            grid_bv = grid.reshape(B * V, N, 1, 2)
+            sampled = F.grid_sample(
+                feats_bv,
+                grid_bv,
+                mode='bilinear',
+                padding_mode='zeros',
+                align_corners=True,
+            )  # (B*V, C, N, 1)
+            sampled = sampled.squeeze(-1).transpose(1, 2)  # (B*V, N, C)
+            sampled = sampled.reshape(B, V, N, -1)  # (B, V, N, C)
+
+            valid_f = valid.float().unsqueeze(-1)  # (B, V, N, 1)
+            sampled = sampled * valid_f
+            denom = valid_f.sum(dim=1).clamp(min=1.0)  # (B, N, 1)
+            cond = sampled.sum(dim=1) / denom  # (B, N, C)
+            return cond
 
     def forward(
         self,

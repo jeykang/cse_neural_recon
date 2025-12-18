@@ -239,55 +239,108 @@ class Trainer:
         for i, batch in enumerate(self.train_loader):
             if i >= num_samples:
                 break
-            
-            depth = batch['depth']  # (B, H, W)
-            pose = batch['pose']    # (B, 4, 4)
-            K = batch['K']          # (B, 3, 3)
-            
-            B, H, W = depth.shape
-            
-            # Create pixel grid
-            v, u = torch.meshgrid(
-                torch.arange(H, dtype=torch.float32),
-                torch.arange(W, dtype=torch.float32),
-                indexing='ij'
-            )
-            
-            for b in range(B):
-                d = depth[b]
-                valid = (d > 0.1) & (d < 30.0)  # Valid depth range
-                
-                if valid.sum() < 100:
-                    continue
-                
-                # Subsample for efficiency
-                valid_idx = torch.where(valid.flatten())[0]
-                sample_idx = valid_idx[torch.randperm(len(valid_idx))[:1000]]
-                
-                # Get intrinsics
-                fx, fy = K[b, 0, 0], K[b, 1, 1]
-                cx, cy = K[b, 0, 2], K[b, 1, 2]
-                
-                # Backproject sampled pixels
-                u_flat, v_flat = u.flatten(), v.flatten()
-                d_flat = d.flatten()
-                
-                u_s = u_flat[sample_idx]
-                v_s = v_flat[sample_idx]
-                d_s = d_flat[sample_idx]
-                
-                X = (u_s - cx) * d_s / fx
-                Y = (v_s - cy) * d_s / fy
-                Z = d_s
-                
-                pts_cam = torch.stack([X, Y, Z], dim=-1)
-                
-                # Transform to world
-                R = pose[b, :3, :3]
-                t = pose[b, :3, 3]
-                pts_world = (R @ pts_cam.T).T + t
-                
-                all_points.append(pts_world)
+
+            # Multi-view batches (conditional training): (B, V, H, W)
+            if 'views_depth' in batch and 'views_pose' in batch and 'views_K' in batch:
+                depth = batch['views_depth']
+                pose = batch['views_pose']
+                K = batch['views_K']
+                valid_mask = batch.get('views_valid_mask', None)
+
+                B, V, H, W = depth.shape
+                v_grid, u_grid = torch.meshgrid(
+                    torch.arange(H, dtype=torch.float32),
+                    torch.arange(W, dtype=torch.float32),
+                    indexing='ij'
+                )
+                u_flat, v_flat = u_grid.flatten(), v_grid.flatten()
+
+                # Limit the number of views used for bounds computation for speed.
+                use_views = min(V, 2)
+                for b in range(B):
+                    for vi in range(use_views):
+                        d = depth[b, vi]
+                        if valid_mask is not None:
+                            valid = valid_mask[b, vi]
+                        else:
+                            valid = (d > 0.1) & (d < 30.0)
+
+                        if valid.sum() < 100:
+                            continue
+
+                        valid_idx = torch.where(valid.flatten())[0]
+                        sample_n = min(1000, int(valid_idx.numel()))
+                        sample_idx = valid_idx[torch.randperm(len(valid_idx))[:sample_n]]
+
+                        fx, fy = K[b, vi, 0, 0], K[b, vi, 1, 1]
+                        cx, cy = K[b, vi, 0, 2], K[b, vi, 1, 2]
+
+                        d_flat = d.flatten()
+                        u_s = u_flat[sample_idx]
+                        v_s = v_flat[sample_idx]
+                        d_s = d_flat[sample_idx]
+
+                        X = (u_s - cx) * d_s / fx
+                        Y = (v_s - cy) * d_s / fy
+                        Z = d_s
+                        pts_cam = torch.stack([X, Y, Z], dim=-1)
+
+                        R = pose[b, vi, :3, :3]
+                        t = pose[b, vi, :3, 3]
+                        pts_world = (R @ pts_cam.T).T + t
+                        all_points.append(pts_world)
+
+            # Single-view batches: (B, H, W)
+            else:
+                depth = batch['depth']  # (B, H, W)
+                pose = batch['pose']    # (B, 4, 4)
+                K = batch['K']          # (B, 3, 3)
+
+                B, H, W = depth.shape
+
+                # Create pixel grid
+                v_grid, u_grid = torch.meshgrid(
+                    torch.arange(H, dtype=torch.float32),
+                    torch.arange(W, dtype=torch.float32),
+                    indexing='ij'
+                )
+
+                u_flat, v_flat = u_grid.flatten(), v_grid.flatten()
+
+                for b in range(B):
+                    d = depth[b]
+                    valid = (d > 0.1) & (d < 30.0)  # Valid depth range
+
+                    if valid.sum() < 100:
+                        continue
+
+                    # Subsample for efficiency
+                    valid_idx = torch.where(valid.flatten())[0]
+                    sample_n = min(1000, int(valid_idx.numel()))
+                    sample_idx = valid_idx[torch.randperm(len(valid_idx))[:sample_n]]
+
+                    # Get intrinsics
+                    fx, fy = K[b, 0, 0], K[b, 1, 1]
+                    cx, cy = K[b, 0, 2], K[b, 1, 2]
+
+                    # Backproject sampled pixels
+                    d_flat = d.flatten()
+                    u_s = u_flat[sample_idx]
+                    v_s = v_flat[sample_idx]
+                    d_s = d_flat[sample_idx]
+
+                    X = (u_s - cx) * d_s / fx
+                    Y = (v_s - cy) * d_s / fy
+                    Z = d_s
+
+                    pts_cam = torch.stack([X, Y, Z], dim=-1)
+
+                    # Transform to world
+                    R = pose[b, :3, :3]
+                    t = pose[b, :3, 3]
+                    pts_world = (R @ pts_cam.T).T + t
+
+                    all_points.append(pts_world)
         
         if all_points:
             all_points = torch.cat(all_points, dim=0)  # (N, 3)
@@ -898,7 +951,20 @@ class Trainer:
             eikonal_points = surface_points[:, :num_eikonal_points].clone()
             eikonal_points.requires_grad_(True)
             
-            eikonal_out = self.model(eikonal_points)
+            if views_rgb is not None and hasattr(self.model, 'encode_views'):
+                # Conditional model requires view conditioning.
+                # Use denormalized coords consistent with the normalization cube.
+                eikonal_points_world = self._denormalize_coords(eikonal_points.detach())
+                eikonal_out = self.model(
+                    eikonal_points,
+                    world_coords=eikonal_points_world,
+                    views_rgb=views_rgb,
+                    views_pose=views_pose,
+                    views_K=views_K,
+                    views_feats=views_feats,
+                )
+            else:
+                eikonal_out = self.model(eikonal_points)
             eikonal_sdf = eikonal_out['sdf']
             
             gradients = torch.autograd.grad(
